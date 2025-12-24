@@ -3,13 +3,9 @@
 // Nice Line – Voice AI (Inbound)
 // Twilio Media Streams <-> OpenAI Realtime API (Alloy)
 //
-// Flow קשיח:
-// 1) study_track (רבנות/דיינות/טוען רבני)
-// 2) first_name
-// 3) last_name
-// 4) phone (digits 9–10; retry once)
-// 5) email optional (retry once; else skip)
-// Always send webhook: completed or partial
+// FIX: Prevent "conversation_already_has_active_response" by using a response queue.
+// Always allow ONLY one active response at a time. Next prompts are queued and sent
+// only after response.completed.
 //
 // Install:
 //   npm i express ws dotenv
@@ -71,9 +67,15 @@ const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 1600);
 if (!OPENAI_API_KEY) console.error('❌ Missing OPENAI_API_KEY');
 if (!MB_WEBHOOK_URL) console.error('❌ Missing MB_WEBHOOK_URL');
 
-function logDebug(...a) { if (MB_DEBUG) console.log('[DEBUG]', ...a); }
-function logInfo(...a) { console.log('[INFO]', ...a); }
-function logError(...a) { console.error('[ERROR]', ...a); }
+function logDebug(...a) {
+  if (MB_DEBUG) console.log('[DEBUG]', ...a);
+}
+function logInfo(...a) {
+  console.log('[INFO]', ...a);
+}
+function logError(...a) {
+  console.error('[ERROR]', ...a);
+}
 
 function digitsOnly(v) {
   if (!v) return '';
@@ -100,7 +102,9 @@ function normalizeStudyTrack(raw) {
   if (t.includes('טוען')) return 'טוען רבני';
   return null;
 }
-function nowIso() { return new Date().toISOString(); }
+function nowIso() {
+  return new Date().toISOString();
+}
 
 async function sendWebhook(payload) {
   if (!MB_WEBHOOK_URL) return;
@@ -140,7 +144,8 @@ const STATES = {
 };
 
 const QUESTIONS = {
-  [STATES.ASK_TRACK]: 'לְאֵיזֶה מַסְלוּל אַתֶּם מְעוֹנְיָנִים? רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי?',
+  [STATES.ASK_TRACK]:
+    'לְאֵיזֶה מַסְלוּל אַתֶּם מְעוֹנְיָנִים? רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי?',
   [STATES.ASK_FIRST]: 'מַה הַשֵּׁם הַפְּרָטִי שֶׁלָּכֶם?',
   [STATES.ASK_LAST]: 'וּמָה שֵׁם הַמִּשְׁפָּחָה?',
   [STATES.ASK_PHONE]: 'בְּאֵיזֶה מִסְפָּר טֵלֵפוֹן נוֹחַ שֶׁנַּחְזֹר אֲלֵיכֶם?',
@@ -161,8 +166,9 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/twilio-media-stream' });
 
-wss.on('connection', (twilioWs, req) => {
-  const tag = `CALL`;
+wss.on('connection', (twilioWs) => {
+  const tag = 'CALL';
+
   let streamSid = null;
   let callSid = null;
   let caller = '';
@@ -187,6 +193,36 @@ wss.on('connection', (twilioWs, req) => {
 
   let lastMediaTs = Date.now();
   let idleWarned = false;
+
+  // barge-in / tail guard
+  let botSpeaking = false;
+  let noListenUntilTs = 0;
+
+  // --- RESPONSE QUEUE (the fix) ---
+  let responseInFlight = false;
+  const responseQueue = [];
+  function enqueueTextPrompt(text, why = '') {
+    responseQueue.push({ text, why });
+    pumpQueue();
+  }
+  function pumpQueue() {
+    if (callEnded) return;
+    if (!openAiReady) return;
+    if (responseInFlight) return;
+    if (responseQueue.length === 0) return;
+
+    const { text, why } = responseQueue.shift();
+    responseInFlight = true;
+    logDebug('QUEUE SEND', why, text);
+
+    openAiWs.send(
+      JSON.stringify({
+        type: 'conversation.item.create',
+        item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] }
+      })
+    );
+    openAiWs.send(JSON.stringify({ type: 'response.create' }));
+  }
 
   function graceMs() {
     return Math.max(2000, Math.min(MB_HANGUP_GRACE_MS, 8000));
@@ -215,52 +251,40 @@ wss.on('connection', (twilioWs, req) => {
     await sendWebhook(payload);
   }
 
-  function endCallFast(reason) {
-    if (callEnded) return;
-    callEnded = true;
-    sendCrm('partial', reason).catch(() => {});
-    try { openAiWs?.close(); } catch {}
-    try { twilioWs?.close(); } catch {}
-  }
-
-  function completedEnough() {
-    return Boolean(lead.study_track && lead.first_name && lead.last_name && (lead.phone_number || normalizeIsraeliPhone('', caller)));
-  }
-
-  function ask(openAiWs) {
-    const q = QUESTIONS[state];
-    if (!q) return;
-    openAiWs.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `שאלו במשפט אחד בלבד: "${q}"` }] }
-    }));
-    openAiWs.send(JSON.stringify({ type: 'response.create' }));
-  }
-
-  function say(openAiWs, text) {
-    openAiWs.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] }
-    }));
-    openAiWs.send(JSON.stringify({ type: 'response.create' }));
-  }
-
-  function finish(openAiWs, status, reason) {
+  function finish(status, reason) {
     if (callEnded) return;
     callEnded = true;
 
     lead.timestamp = lead.timestamp || nowIso();
-
     sendCrm(status, reason).catch(() => {});
-    // say closing then close after grace
-    say(openAiWs, `סיימו במשפט הבא בלבד: "${MB_CLOSING_SCRIPT}"`);
+
+    // closing -> then close after grace (also queued safely)
+    enqueueTextPrompt(`סיימו במשפט הבא בלבד: "${MB_CLOSING_SCRIPT}"`, 'closing');
+
     setTimeout(() => {
-      try { openAiWs?.close(); } catch {}
-      try { twilioWs?.close(); } catch {}
+      try {
+        openAiWs?.close();
+      } catch {}
+      try {
+        twilioWs?.close();
+      } catch {}
     }, graceMs());
   }
 
-  // OpenAI Realtime WS
+  function askCurrent() {
+    const q = QUESTIONS[state];
+    if (!q) return;
+    enqueueTextPrompt(`שאלו במשפט אחד בלבד: "${q}"`, `ask_${state}`);
+  }
+
+  function sayThanksThenAskNext(nextState) {
+    state = nextState;
+    // בלי setTimeout בכלל — הכל בתור, לפי response.completed
+    enqueueTextPrompt('אמרו בקצרה: "תּוֹדָה."', 'thanks');
+    askCurrent();
+  }
+
+  // OpenAI WS
   const openAiWs = new WebSocket(
     'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
     {
@@ -274,47 +298,74 @@ wss.on('connection', (twilioWs, req) => {
   openAiWs.on('open', () => {
     openAiReady = true;
 
-    openAiWs.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        model: 'gpt-4o-realtime-preview-2024-12-17',
-        modalities: ['audio', 'text'],
-        voice: OPENAI_VOICE,
-        input_audio_format: 'g711_ulaw',
-        output_audio_format: 'g711_ulaw',
-        input_audio_transcription: { model: 'whisper-1' },
-        turn_detection: {
-          type: 'server_vad',
-          threshold: MB_VAD_THRESHOLD,
-          silence_duration_ms: MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS,
-          prefix_padding_ms: MB_VAD_PREFIX_MS
-        },
-        max_response_output_tokens: 240,
-        instructions: STRICT_SYSTEM_PROMPT
-      }
-    }));
+    openAiWs.send(
+      JSON.stringify({
+        type: 'session.update',
+        session: {
+          model: 'gpt-4o-realtime-preview-2024-12-17',
+          modalities: ['audio', 'text'],
+          voice: OPENAI_VOICE,
+          input_audio_format: 'g711_ulaw',
+          output_audio_format: 'g711_ulaw',
+          input_audio_transcription: { model: 'whisper-1' },
+          turn_detection: {
+            type: 'server_vad',
+            threshold: MB_VAD_THRESHOLD,
+            silence_duration_ms: MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS,
+            prefix_padding_ms: MB_VAD_PREFIX_MS
+          },
+          max_response_output_tokens: 240,
+          instructions: STRICT_SYSTEM_PROMPT
+        }
+      })
+    );
 
-    // opening + first question
-    say(openAiWs, `פתחו במשפט הבא בלבד: "${MB_OPENING_SCRIPT}" ואז מיד שאלו: "${QUESTIONS[STATES.ASK_TRACK]}"`);
+    // IMPORTANT: Opening + First question in ONE queued response chain (no overlap)
+    enqueueTextPrompt(
+      `פתחו במשפט הבא בלבד: "${MB_OPENING_SCRIPT}" ולאחר מכן, בלי להוסיף שום דבר נוסף, שאלו: "${QUESTIONS[STATES.ASK_TRACK]}"`,
+      'opening_and_first'
+    );
   });
 
   openAiWs.on('message', async (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
     if (msg.type === 'response.audio.delta') {
       if (!streamSid) return;
+      botSpeaking = true;
+      noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
       twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: msg.delta } }));
+      return;
+    }
+
+    if (msg.type === 'response.audio.done') {
+      botSpeaking = false;
+      return;
+    }
+
+    // This is the key: only after completed we allow next queued response
+    if (msg.type === 'response.completed') {
+      responseInFlight = false;
+      pumpQueue();
       return;
     }
 
     if (msg.type === 'conversation.item.input_audio_transcription.completed') {
       const userText = (msg.transcript || '').trim();
-      if (!userText) return;
+      if (!userText || callEnded) return;
 
+      logDebug('USER', userText);
+
+      // Off-script
       if (isOffScriptQuestion(userText)) {
-        say(openAiWs, `ענו במשפט אחד בלבד: "${offScriptReply()}"`);
-        setTimeout(() => { if (!callEnded) ask(openAiWs); }, 350);
+        enqueueTextPrompt(`ענו במשפט אחד בלבד: "${offScriptReply()}"`, 'off_script_reply');
+        // then repeat current question
+        askCurrent();
         return;
       }
 
@@ -322,29 +373,28 @@ wss.on('connection', (twilioWs, req) => {
       if (state === STATES.ASK_TRACK) {
         const tr = normalizeStudyTrack(userText);
         if (!tr) {
-          say(openAiWs, 'אפשר לבחור אחד משלושת המסלולים: רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי.');
+          enqueueTextPrompt(
+            'אפשר לבחור אחד משלושת המסלולים: רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי.',
+            'track_clarify_once'
+          );
+          // repeat same question
+          askCurrent();
           return;
         }
         lead.study_track = tr;
-        say(openAiWs, 'תּוֹדָה.');
-        state = STATES.ASK_FIRST;
-        setTimeout(() => ask(openAiWs), 350);
+        sayThanksThenAskNext(STATES.ASK_FIRST);
         return;
       }
 
       if (state === STATES.ASK_FIRST) {
         lead.first_name = userText;
-        say(openAiWs, 'תּוֹדָה.');
-        state = STATES.ASK_LAST;
-        setTimeout(() => ask(openAiWs), 350);
+        sayThanksThenAskNext(STATES.ASK_LAST);
         return;
       }
 
       if (state === STATES.ASK_LAST) {
         lead.last_name = userText;
-        say(openAiWs, 'תּוֹדָה.');
-        state = STATES.ASK_PHONE;
-        setTimeout(() => ask(openAiWs), 350);
+        sayThanksThenAskNext(STATES.ASK_PHONE);
         return;
       }
 
@@ -353,105 +403,115 @@ wss.on('connection', (twilioWs, req) => {
         if (!phone) {
           if (!lead.__phone_retry) {
             lead.__phone_retry = true;
-            say(openAiWs, 'לצורך רישום, צריך מספר בספרות בלבד, באורך תשע עד עשר ספרות. אפשר לחזור על המספר?');
+            enqueueTextPrompt(
+              'לצורך רישום, צריך מספר בספרות בלבד, באורך תשע עד עשר ספרות. אפשר לחזור על המספר?',
+              'phone_retry_once'
+            );
+            // ask again
+            askCurrent();
             return;
           }
-          // invalid twice => partial
-          finish(openAiWs, 'partial', 'invalid_phone_twice');
+          // invalid twice -> partial
+          finish('partial', 'invalid_phone_twice');
           return;
         }
         lead.phone_number = phone;
-        say(openAiWs, 'תּוֹדָה.');
-        state = STATES.ASK_EMAIL;
-        setTimeout(() => ask(openAiWs), 350);
+        sayThanksThenAskNext(STATES.ASK_EMAIL);
         return;
       }
 
       if (state === STATES.ASK_EMAIL) {
         const t = userText.toLowerCase();
         const saysNo = t.includes('אין') || t.includes('לא') || t.includes('בלי');
+
         if (saysNo) {
           lead.email = '';
           lead.timestamp = nowIso();
-          finish(openAiWs, 'completed', 'done_no_email');
+          finish('completed', 'done_no_email');
           return;
         }
 
         if (isValidEmailLike(userText)) {
           lead.email = userText.trim();
           lead.timestamp = nowIso();
-          finish(openAiWs, 'completed', 'done_with_email');
+          finish('completed', 'done_with_email');
           return;
         }
 
         if (!lead.__email_retry) {
           lead.__email_retry = true;
-          say(openAiWs, 'אם יש מייל, אפשר לומר אותו שוב לאט. ואם אין, אפשר לומר "אין".');
+          enqueueTextPrompt('אם יש מייל, אפשר לומר אותו שוב לאט. ואם אין, אפשר לומר "אין".', 'email_retry_once');
+          // ask again (same prompt)
+          askCurrent();
           return;
         }
 
         // give up without pressure
         lead.email = '';
         lead.timestamp = nowIso();
-        finish(openAiWs, 'completed', 'done_email_skipped');
+        finish('completed', 'done_email_skipped');
         return;
       }
     }
 
     if (msg.type === 'error') {
+      // IMPORTANT: don't crash the call. Mark response as not in flight and keep going.
       logError('OpenAI error', msg);
-      endCallFast('openai_error');
+      responseInFlight = false;
+      pumpQueue();
+      // If the error is persistent, call will end by close/error handlers.
     }
   });
 
   openAiWs.on('close', () => {
-    if (!callEnded) endCallFast('openai_closed');
+    if (!callEnded) finish('partial', 'openai_closed');
   });
   openAiWs.on('error', () => {
-    if (!callEnded) endCallFast('openai_ws_error');
+    if (!callEnded) finish('partial', 'openai_ws_error');
   });
 
   // Idle timers
   const idleInterval = setInterval(() => {
     if (callEnded) return;
     const since = Date.now() - lastMediaTs;
+
     if (!idleWarned && since >= MB_IDLE_WARNING_MS) {
       idleWarned = true;
-      if (openAiReady) say(openAiWs, 'אני עדיין כאן על הקו. אתם איתי?');
+      enqueueTextPrompt('אני עדיין כאן על הקו. אתם איתי?', 'idle_warning');
     }
     if (since >= MB_IDLE_HANGUP_MS) {
-      if (openAiReady) finish(openAiWs, 'partial', 'idle_timeout');
-      else endCallFast('idle_timeout');
+      finish('partial', 'idle_timeout');
       clearInterval(idleInterval);
     }
   }, 1000);
 
   // Max call timers
-  let maxWarnT = null, maxEndT = null;
+  let maxWarnT = null,
+    maxEndT = null;
   if (MB_MAX_CALL_MS > 0) {
     if (MB_MAX_WARN_BEFORE_MS > 0 && MB_MAX_CALL_MS > MB_MAX_WARN_BEFORE_MS) {
       maxWarnT = setTimeout(() => {
-        if (!callEnded && openAiReady) say(openAiWs, 'אנחנו מתקרבים לסיום. אפשר להשלים את הפרטים עכשיו.');
+        if (!callEnded) enqueueTextPrompt('אנחנו מתקרבים לסיום. אפשר להשלים את הפרטים עכשיו.', 'max_call_warning');
       }, MB_MAX_CALL_MS - MB_MAX_WARN_BEFORE_MS);
     }
     maxEndT = setTimeout(() => {
-      if (!callEnded) {
-        if (openAiReady) finish(openAiWs, 'partial', 'max_call_duration');
-        else endCallFast('max_call_duration');
-      }
+      if (!callEnded) finish('partial', 'max_call_duration');
     }, MB_MAX_CALL_MS);
   }
 
   // Twilio WS side
   twilioWs.on('message', (data) => {
     let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
 
     if (msg.event === 'start') {
       streamSid = msg.start?.streamSid || null;
       callSid = msg.start?.callSid || null;
 
-      // parameters from <Stream><Parameter>
       const p = msg.start?.customParameters || {};
       caller = p.caller || '';
       called = p.called || '';
@@ -465,44 +525,44 @@ wss.on('connection', (twilioWs, req) => {
       lastMediaTs = Date.now();
       if (!openAiReady) return;
 
-      // barge-in control
+      // If barge-in disabled, ignore user audio while bot is speaking / tail window
+      const now = Date.now();
       if (!MB_ALLOW_BARGE_IN) {
-        // simplest: don’t stream user audio while the model is producing output is handled implicitly by VAD + short responses.
-        // keep it minimal and stable
+        if (botSpeaking || now < noListenUntilTs) return;
       }
 
       const payload = msg.media?.payload;
       if (!payload) return;
+
       openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
       return;
     }
 
     if (msg.event === 'stop') {
       if (!callEnded) {
-        // partial + close
-        sendCrm(completedEnough() ? 'completed' : 'partial', 'twilio_stop').catch(() => {});
+        // if we have enough -> completed else partial
+        const enough =
+          lead.study_track &&
+          lead.first_name &&
+          lead.last_name &&
+          (lead.phone_number || normalizeIsraeliPhone('', caller));
+        finish(enough ? 'completed' : 'partial', 'twilio_stop');
       }
-      callEnded = true;
-      clearInterval(idleInterval);
-      if (maxWarnT) clearTimeout(maxWarnT);
-      if (maxEndT) clearTimeout(maxEndT);
-      try { openAiWs.close(); } catch {}
-      try { twilioWs.close(); } catch {}
     }
   });
 
   twilioWs.on('close', () => {
-    if (!callEnded) endCallFast('twilio_ws_closed');
     clearInterval(idleInterval);
     if (maxWarnT) clearTimeout(maxWarnT);
     if (maxEndT) clearTimeout(maxEndT);
+    if (!callEnded) finish('partial', 'twilio_ws_closed');
   });
 
   twilioWs.on('error', () => {
-    if (!callEnded) endCallFast('twilio_ws_error');
     clearInterval(idleInterval);
     if (maxWarnT) clearTimeout(maxWarnT);
     if (maxEndT) clearTimeout(maxEndT);
+    if (!callEnded) finish('partial', 'twilio_ws_error');
   });
 });
 
