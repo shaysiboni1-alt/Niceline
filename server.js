@@ -1,130 +1,80 @@
-// server.js
-//
-// NiceLine Voice AI – Lead Registration Bot (Motti)
-// Twilio Media Streams <-> OpenAI Realtime API
-//
-// Fixes in this version:
-// ✅ No sending to OpenAI before WS open (queue)
-// ✅ No concurrent responses (prevents "conversation_already_has_active_response")
-// ✅ Forces modalities ["audio","text"] (prevents "Invalid modalities: ['audio']")
-// ✅ Per-call state reset (no "continues from previous call")
-// ✅ Send Make webhook ONLY on call end (full/partial)
-// ✅ Recording: start on call start, attach recording_url when callback arrives (single lead send waits briefly)
-//
-// ENV (minimal):
-//   OPENAI_API_KEY (required)
-//   OPENAI_VOICE (default: "cedar")
-//   MB_CONVERSATION_PROMPT (required)  // JSON string: {"system":"..."} OR plain string
-//   MB_OPENING_TEXT (required)
-//   MB_CLOSING_TEXT (required)
-//   MB_WEBHOOK_URL (optional)
-//   MB_DEBUG (true/false)
-//   MB_ENABLE_RECORDING (true/false)
-//   MB_RECORDING_STATUS_CALLBACK_URL (optional; default: https://<host>/twilio-recording-callback)
-//   TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN (required only if MB_ENABLE_RECORDING=true)
-//   MB_SPEECH_SPEED (default: 0.98)
-//   MB_STT_LANGUAGE (default: "he")
-//
-// Run: node server.js
+/**
+ * Niceline – MisterBot Realtime Voice (MALAM)
+ * Twilio Media Streams <-> OpenAI Realtime API
+ *
+ * Fixes:
+ * 1) twilio dependency is required (recordings + auth)
+ * 2) OpenAI modalities must be ['audio','text'] (NOT ['audio'] alone)
+ * 3) Send MAKE webhook only ONCE at call end, with recording_url included if available
+ */
 
-"use strict";
-
+require("dotenv").config();
 const express = require("express");
-const http = require("http");
 const WebSocket = require("ws");
+const Twilio = require("twilio");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 10000;
 
-const MB_DEBUG = String(process.env.MB_DEBUG || "false").toLowerCase() === "true";
+// ========= ENV =========
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
+const OPENAI_VOICE = process.env.OPENAI_VOICE || "cedar";
+
+const MB_WEBHOOK_URL = process.env.MB_WEBHOOK_URL || ""; // Make webhook
+const MB_DEBUG = String(process.env.MB_DEBUG || "false") === "true";
+
+const MB_OPENING_TEXT = process.env.MB_OPENING_TEXT || "שלום, הגעתם למערכת הרישום של מרכז מל\"מ. כדי שיועץ לימודים יחזור אליכם לבדיקת התאמה, אשאל כמה שאלות קצרות. זה בסדר מבחינתכם?";
+const MB_CLOSING_TEXT = process.env.MB_CLOSING_TEXT || "תודה רבה, הפרטים נשמרו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
+const MB_CONVERSATION_PROMPT_RAW = process.env.MB_CONVERSATION_PROMPT || "{}";
+
+const MB_ENABLE_RECORDING = String(process.env.MB_ENABLE_RECORDING || "false") === "true";
+const MB_RECORDING_STATUS_CALLBACK_URL = process.env.MB_RECORDING_STATUS_CALLBACK_URL || ""; // e.g. https://niceline.onrender.com/twilio-recording-callback
+
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+
+const MB_IDLE_WARNING_MS = Number(process.env.MB_IDLE_WARNING_MS || 25000);
+const MB_IDLE_HANGUP_MS = Number(process.env.MB_IDLE_HANGUP_MS || 55000);
+const MB_MAX_CALL_MS = Number(process.env.MB_MAX_CALL_MS || 240000);
+
+const MB_VAD_THRESHOLD = Number(process.env.MB_VAD_THRESHOLD || 0.65);
+const MB_VAD_PREFIX_MS = Number(process.env.MB_VAD_PREFIX_MS || 200);
+const MB_VAD_SILENCE_MS = Number(process.env.MB_VAD_SILENCE_MS || 900);
+const MB_VAD_SUFFIX_MS = Number(process.env.MB_VAD_SUFFIX_MS || 200);
 
 function log(...args) {
-  console.log("[INFO]", ...args);
-}
-function warn(...args) {
-  console.warn("[WARN]", ...args);
-}
-function err(...args) {
-  console.error("[ERROR]", ...args);
+  console.log(...args);
 }
 
-function safeJsonParse(str) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
+// ========= Call store (per-call, no global conversation reuse) =========
+/**
+ * calls[callSid] = {
+ *   startedAt,
+ *   streamSid,
+ *   caller_id,
+ *   called,
+ *   source,
+ *   lead: {first_name,last_name,phone_number,study_track},
+ *   call_status, call_status_code, reason,
+ *   recording_url,
+ *   ended: boolean,
+ *   sentToMake: boolean,
+ *   waitRecordingTimer: NodeJS.Timeout | null,
+ * }
+ */
+const calls = new Map();
+
+function safeJsonParse(str, fallback) {
+  try { return JSON.parse(str); } catch { return fallback; }
 }
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  throw new Error("Missing OPENAI_API_KEY");
-}
-
-const OPENAI_VOICE = process.env.OPENAI_VOICE || "cedar";
-const MB_OPENING_TEXT = (process.env.MB_OPENING_TEXT || "").trim();
-const MB_CLOSING_TEXT = (process.env.MB_CLOSING_TEXT || "").trim();
-const MB_WEBHOOK_URL = (process.env.MB_WEBHOOK_URL || "").trim();
-
-const MB_ENABLE_RECORDING = String(process.env.MB_ENABLE_RECORDING || "false").toLowerCase() === "true";
-const MB_RECORDING_STATUS_CALLBACK_URL =
-  (process.env.MB_RECORDING_STATUS_CALLBACK_URL || "").trim() || null;
-
-const MB_SPEECH_SPEED = Number(process.env.MB_SPEECH_SPEED || "0.98");
-const MB_STT_LANGUAGE = (process.env.MB_STT_LANGUAGE || "he").trim();
-
-const rawPrompt = (process.env.MB_CONVERSATION_PROMPT || "").trim();
-if (!rawPrompt) throw new Error("Missing MB_CONVERSATION_PROMPT");
-
-const parsedPrompt = safeJsonParse(rawPrompt);
-const SYSTEM_PROMPT =
-  (parsedPrompt && (parsedPrompt.system || parsedPrompt.prompt || parsedPrompt.instructions)) ||
-  rawPrompt;
-
-// --- Twilio client (for recording) ---
-let twilioClient = null;
-if (MB_ENABLE_RECORDING) {
-  const Twilio = require("twilio");
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const token = process.env.TWILIO_AUTH_TOKEN;
-  if (!sid || !token) {
-    throw new Error("MB_ENABLE_RECORDING=true requires TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN");
-  }
-  twilioClient = Twilio(sid, token);
-}
-
-// --- In-memory sessions by callSid ---
-const sessions = new Map(); // callSid -> session
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-function isHebrewDigitsPhone(s) {
-  const digits = String(s || "").replace(/\D/g, "");
-  return digits.length === 9 || digits.length === 10;
-}
-
-function normalizeTrack(s) {
-  const t = String(s || "").toLowerCase().trim();
-
-  // Hebrew
-  if (/(רבנות|רַבָּנוּת|רבנוּת)/.test(t)) return "רבנות";
-  if (/(דיינות|דַּיָּנוּת|דיינuת)/.test(t)) return "דיינות";
-  if (/(טוען\s*רבני|טוֹעֵן\s*רַבָּנִי|טוען-רבני|טוען רבני)/.test(t)) return "טוען רבני";
-
-  // Latin / mixed
-  // IMPORTANT: do NOT use [] with hyphen ranges that break regex
-  if (/rabbanut|rabba(?:\s|-)?nut|rabb?a(?:\s|-)?nut/.test(t)) return "רבנות";
-  if (/dayanut|daya(?:\s|-)?nut|dayan(?:u|o)?t/.test(t)) return "דיינות";
-  if (/toen(?:\s|-)?rabani|toen(?:\s|-)?rabbani|t(?:o|u)en(?:\s|-)?rabani/.test(t)) return "טוען רבני";
-
-  return "";
-}
-
-// --- webhook sender ---
 async function postToMake(payload) {
   if (!MB_WEBHOOK_URL) return { ok: false, reason: "no_webhook" };
   try {
@@ -133,493 +83,631 @@ async function postToMake(payload) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
-    const text = await res.text().catch(() => "");
-    return { ok: res.ok, status: res.status, body: text, reason: res.ok ? "make_ok" : "make_http_error" };
+    const txt = await res.text().catch(() => "");
+    return { ok: res.ok, status: res.status, body: txt || "" , reason: res.ok ? "make_ok" : "make_http_error" };
   } catch (e) {
-    return { ok: false, reason: "make_fetch_error", error: String(e?.message || e) };
+    return { ok: false, reason: "make_fetch_error", error: String(e) };
   }
 }
 
-// Wait a bit for recording_url then send ONCE
-async function finalizeAndSend(callSid, reason = "call_end") {
-  const s = sessions.get(callSid);
-  if (!s) return;
-  if (s.sent) return;
-
-  s.ended = true;
-  s.endReason = reason;
-
-  // wait up to 10s for recording url (if enabled)
-  const waitMs = MB_ENABLE_RECORDING ? 10000 : 0;
-  const start = Date.now();
-  while (MB_ENABLE_RECORDING && !s.recordingUrl && Date.now() - start < waitMs) {
-    await new Promise((r) => setTimeout(r, 250));
-  }
-
-  const call_status_code = s.completed ? "full" : "partial";
-  const call_status = s.completed ? "שיחה מלאה" : "שיחה חלקית";
-
+function buildLeadPayload(callSid, update_type = "lead_final") {
+  const c = calls.get(callSid) || {};
+  const lead = c.lead || {};
   const payload = {
-    update_type: "lead",
-    first_name: s.lead.first_name || "",
-    last_name: s.lead.last_name || "",
-    phone_number: s.lead.phone_number || "",
-    study_track: s.lead.study_track || "",
-    source: s.source || "Voice AI - Nice Line",
-    timestamp: s.startedAt || nowIso(),
-    caller_id: s.caller || "",          // ✅ זה מספר הלקוח (From)
-    called: s.called || "",             // ✅ זה מספר הבוט (To)
-    callSid: s.callSid || callSid,
-    streamSid: s.streamSid || "",
-    call_status,
-    call_status_code,
-    reason: s.endReason || reason,
-    recording_url: s.recordingUrl || "",
-    remarks:
-      `מסלול: ${s.lead.study_track || ""} | סטטוס: ${call_status} | caller: ${s.caller || ""} | callSid: ${s.callSid || callSid}`,
+    update_type,
+    first_name: lead.first_name || "",
+    last_name: lead.last_name || "",
+    phone_number: lead.phone_number || "",
+    study_track: lead.study_track || "",
+    source: c.source || "Voice AI - Nice Line",
+    timestamp: nowIso(),
+    caller_id: c.caller_id || "",      // ✅ זה המספר של הלקוח (From)
+    called: c.called || "",            // ✅ זה המספר של הבוט (To)
+    callSid: callSid || "",
+    streamSid: c.streamSid || "",
+    call_status: c.call_status || "",
+    call_status_code: c.call_status_code || "",
+    reason: c.reason || "",
+    recording_url: c.recording_url || "",
+    remarks: c.remarks || ""
   };
-
-  if (MB_DEBUG) log("CRM> sending", payload);
-  const result = await postToMake(payload);
-  if (MB_DEBUG) log("CRM> result", result);
-
-  s.sent = true;
-
-  // cleanup
-  setTimeout(() => sessions.delete(callSid), 30000);
+  return payload;
 }
 
-// --- HTTP routes ---
-app.get("/health", (req, res) => res.json({ ok: true }));
+async function finalizeAndSendOnce(callSid) {
+  const c = calls.get(callSid);
+  if (!c) return;
 
-app.post("/twilio-recording-callback", (req, res) => {
-  // Twilio hits this after recording is ready
-  const callSid = req.body?.CallSid || req.query?.CallSid;
-  const recordingUrl = req.body?.RecordingUrl || req.query?.RecordingUrl;
+  if (c.sentToMake) return; // ✅ פעם אחת בלבד
 
-  if (MB_DEBUG) log("RECORDING callback", { callSid, recordingUrl });
+  c.sentToMake = true;
 
-  if (callSid && recordingUrl) {
-    const s = sessions.get(callSid);
-    if (s) {
-      s.recordingUrl = recordingUrl;
+  const payload = buildLeadPayload(callSid, "lead_final");
+  log("[INFO] CRM> sending FINAL", payload);
+
+  const result = await postToMake(payload);
+  log("[INFO] CRM> final result", result);
+}
+
+function scheduleFinalizeWaitingRecording(callSid) {
+  const c = calls.get(callSid);
+  if (!c) return;
+
+  // אם כבר יש recording_url או הקלטה לא מופעלת – שולחים מיד
+  if (!MB_ENABLE_RECORDING || c.recording_url) {
+    finalizeAndSendOnce(callSid);
+    return;
+  }
+
+  // אחרת מחכים קצת שה-recording callback יגיע ואז שולחים payload אחד שמכיל recording_url
+  if (c.waitRecordingTimer) clearTimeout(c.waitRecordingTimer);
+
+  c.waitRecordingTimer = setTimeout(() => {
+    c.waitRecordingTimer = null;
+    finalizeAndSendOnce(callSid);
+  }, 9000); // 9 שניות המתנה (מספיק ברוב המקרים)
+}
+
+// ========= Health =========
+app.get("/health", (req, res) => {
+  res.json({ ok: true, time: nowIso() });
+});
+
+// ========= Twilio Recording Callback (server-side) =========
+// Twilio will call this endpoint when recording is ready (if you set RecordingStatusCallback)
+app.post("/twilio-recording-callback", async (req, res) => {
+  // Twilio sends x-www-form-urlencoded by default, but express.json won't parse it.
+  // In practice, many people configure Twilio callback to send form-encoded.
+  // We'll accept both: if body is empty, try manual parsing.
+  try {
+    // If your Render has only json parser, Twilio might not parse -> you can add urlencoded middleware.
+    // We'll add it below too.
+    res.status(200).send("ok");
+  } catch {
+    res.status(200).send("ok");
+  }
+});
+
+// add urlencoded to properly parse Twilio form callbacks
+app.use(express.urlencoded({ extended: false }));
+
+app.post("/twilio-recording-callback", async (req, res) => {
+  const callSid = req.body.CallSid || req.body.callSid || "";
+  const recordingUrl = req.body.RecordingUrl || req.body.recordingUrl || "";
+  log("[INFO] RECORDING callback", { callSid, recordingUrl });
+
+  if (callSid && calls.has(callSid)) {
+    const c = calls.get(callSid);
+    c.recording_url = recordingUrl || c.recording_url || "";
+
+    // אם השיחה כבר הסתיימה ומחכים להקלטה – שולחים עכשיו
+    if (c.ended && !c.sentToMake) {
+      if (c.waitRecordingTimer) {
+        clearTimeout(c.waitRecordingTimer);
+        c.waitRecordingTimer = null;
+      }
+      await finalizeAndSendOnce(callSid);
     }
   }
+
   res.status(200).send("ok");
 });
 
-const server = http.createServer(app);
+// ========= Start server =========
+const server = app.listen(PORT, () => {
+  log("[INFO] ✅ Server running on port", PORT);
+});
 
-// --- WebSocket server for Twilio Media Streams ---
+// ========= WebSocket server for Twilio Media Streams =========
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-// OpenAI Realtime endpoint
-// NOTE: keep your existing model if working. This is the safe default format:
-const OPENAI_REALTIME_URL =
-  "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+function openaiWsConnect() {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+  const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
 
-function openAiHeaders() {
-  return {
-    Authorization: `Bearer ${OPENAI_API_KEY}`,
-    "OpenAI-Beta": "realtime=v1",
-  };
+  const ws = new WebSocket(url, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+  });
+
+  return ws;
 }
 
-function buildSessionUpdate() {
-  // IMPORTANT: temperature must be >= 0.6 (you had 0 and it crashed audio)
-  return {
-    type: "session.update",
-    session: {
-      modalities: ["audio", "text"],
-      voice: OPENAI_VOICE,
+function sendOpenAi(ws, obj) {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify(obj));
+  return true;
+}
+
+function normalizeText(s) {
+  return String(s || "").trim();
+}
+
+// Very simple parsers for lead fields (you can expand later)
+function detectTrack(text) {
+  const t = normalizeText(text).toLowerCase();
+
+  // Hebrew
+  if (t.includes("רבנות")) return "רבנות";
+  if (t.includes("דיינות") || t.includes("דיינ")) return "דיינות";
+  if (t.includes("טוען") || t.includes("טוען רבני") || t.includes("טוען-רבני")) return "טוען רבני";
+
+  // English-ish
+  if (/(dayanut|dayanut|dayanut|dayan)/i.test(t)) return "דיינות";
+  if (/(toen|toen rabani|rabani)/i.test(t)) return "טוען רבני";
+  if (/(rabbanut|rabb?anut|rabba\s?nut|rabbanut)/i.test(t)) return "רבנות";
+
+  return "";
+}
+
+function extractPhone(text) {
+  const s = normalizeText(text).replace(/[^\d+]/g, "");
+  // Israel numbers often 10 digits starting 05/0
+  const digits = s.replace(/\D/g, "");
+  if (digits.length >= 9 && digits.length <= 15) return digits;
+  return "";
+}
+
+function isYes(text) {
+  const t = normalizeText(text).toLowerCase();
+  return ["כן", "כן.", "יאפ", "בטח", "אוקיי", "ok", "okay", "yes", "yep", "sure"].some(x => t === x || t.includes(x));
+}
+function isNo(text) {
+  const t = normalizeText(text).toLowerCase();
+  return ["לא", "לא.", "לא רוצה", "no", "nope", "never"].some(x => t === x || t.includes(x));
+}
+
+function buildSystemPrompt() {
+  const j = safeJsonParse(MB_CONVERSATION_PROMPT_RAW, {});
+  const sys = (j && typeof j.system === "string") ? j.system : "";
+  // We keep your rule: opening/closing are NOT to be rewritten by the model.
+  return [
+    sys,
+    "",
+    "חוקים טכניים:",
+    "- הפתיח מגיע מ-MB_OPENING_TEXT והסגירה מ-MB_CLOSING_TEXT. אסור לשנות/לנסח אותם מחדש.",
+    "- תענו קצר וברור. אם מישהו מתחכם: משפט אחד קצר וחזרה לשאלה הנוכחית."
+  ].join("\n");
+}
+
+function ttsExact(openaiWs, text) {
+  // Ask the model to speak EXACTLY this text (best-effort).
+  sendOpenAi(openaiWs, {
+    type: "response.create",
+    response: {
+      modalities: ["audio", "text"], // ✅ must be audio+text
+      instructions: `קראו מילה במילה, ללא שינוי, בדיוק כך:\n${text}`,
+      // temperature must be >= 0.6 according to your error
       temperature: 0.7,
-      input_audio_transcription: {
-        model: "gpt-4o-mini-transcribe",
-        language: MB_STT_LANGUAGE,
-      },
-      turn_detection: { type: "server_vad" },
-      // Make it speak a bit faster (your request)
-      output_audio_format: "g711_ulaw",
-      instructions: SYSTEM_PROMPT,
-    },
-  };
+    }
+  });
 }
 
 wss.on("connection", (twilioWs, req) => {
-  // Per-call variables (DO NOT leak between calls)
   let callSid = "";
   let streamSid = "";
   let caller = "";
   let called = "";
   let source = "Voice AI - Nice Line";
 
-  // Create OpenAI WS
-  const openAiWs = new WebSocket(OPENAI_REALTIME_URL, { headers: openAiHeaders() });
+  let openaiWs = null;
 
-  // OpenAI send queue until socket is open
-  const pendingToOpenAI = [];
-  let openAiReady = false;
+  // per-call state machine
+  let state = "CONSENT"; // CONSENT -> ASK_TRACK -> ASK_FIRST -> ASK_LAST -> ASK_PHONE_CHOICE -> ASK_PHONE -> DONE
+  let lastUserHeardAt = Date.now();
+  let callStartedAt = Date.now();
+  let idleWarningSent = false;
 
-  // Response lock (prevents "already_has_active_response")
-  let activeResponse = false;
-
-  function sendToOpenAI(obj) {
-    const msg = JSON.stringify(obj);
-    if (!openAiReady || openAiWs.readyState !== WebSocket.OPEN) {
-      pendingToOpenAI.push(msg);
-      return;
-    }
-    openAiWs.send(msg);
-  }
-
-  function flushOpenAIQueue() {
-    while (pendingToOpenAI.length && openAiWs.readyState === WebSocket.OPEN) {
-      openAiWs.send(pendingToOpenAI.shift());
-    }
-  }
-
-  function speakExact(text) {
-    const line = String(text || "").trim();
-    if (!line) return;
-
-    // We force the model to SAY EXACTLY, not paraphrase:
-    sendToOpenAI({
-      type: "response.create",
-      response: {
-        modalities: ["audio", "text"], // ✅ force valid combo every time
-        temperature: 0.6,
-        instructions:
-          `אָמְרוּ בְּדִיּוּק מִלָּה בְּמִלָּה (לֹא לְשַׁנּוֹת כְּלוּם, לֹא לְהוֹסִיף, לֹא לְגָרֹעַ):\n` +
-          `${line}`,
-      },
-    });
-    activeResponse = true;
-  }
-
-  // --- Deterministic flow state (no LLM deciding next step) ---
-  const STATES = {
-    CONSENT: "CONSENT",
-    ASK_TRACK: "ASK_TRACK",
-    ASK_FIRST: "ASK_FIRST",
-    ASK_LAST: "ASK_LAST",
-    ASK_PHONE_CHOICE: "ASK_PHONE_CHOICE",
-    ASK_PHONE: "ASK_PHONE",
-    DONE: "DONE",
-  };
-
-  let state = STATES.CONSENT;
-
-  // lead object
-  const lead = {
-    first_name: "",
-    last_name: "",
-    phone_number: "",
-    study_track: "",
-  };
-
-  function ensureSessionCreated() {
+  function ensureCallRecord() {
     if (!callSid) return;
-    if (!sessions.has(callSid)) {
-      sessions.set(callSid, {
-        callSid,
+    if (!calls.has(callSid)) {
+      calls.set(callSid, {
+        startedAt: nowIso(),
         streamSid,
-        caller,
+        caller_id: caller,
         called,
         source,
-        startedAt: nowIso(),
-        lead,
-        sent: false,
+        lead: { first_name: "", last_name: "", phone_number: "", study_track: "" },
+        call_status: "",
+        call_status_code: "",
+        reason: "",
+        recording_url: "",
+        remarks: "",
         ended: false,
-        endReason: "",
-        recordingUrl: "",
-        completed: false,
+        sentToMake: false,
+        waitRecordingTimer: null,
       });
+    } else {
+      // refresh
+      const c = calls.get(callSid);
+      c.streamSid = streamSid || c.streamSid;
+      c.caller_id = caller || c.caller_id;
+      c.called = called || c.called;
+      c.source = source || c.source;
     }
   }
 
-  async function startRecordingIfEnabled() {
-    if (!MB_ENABLE_RECORDING || !twilioClient || !callSid) return;
-    try {
-      const cb =
-        MB_RECORDING_STATUS_CALLBACK_URL ||
-        `https://${req.headers.host}/twilio-recording-callback`;
+  function setLeadField(key, val) {
+    ensureCallRecord();
+    const c = calls.get(callSid);
+    if (!c) return;
+    c.lead[key] = val;
+  }
 
-      const rec = await twilioClient.calls(callSid).recordings.create({
-        recordingStatusCallback: cb,
-        recordingStatusCallbackMethod: "POST",
-      });
-
-      if (MB_DEBUG) log("RECORDING>", { ok: true, reason: "recording_started", sid: rec.sid });
-    } catch (e) {
-      warn("RECORDING> failed", String(e?.message || e));
+  function endCall(reasonCode) {
+    ensureCallRecord();
+    const c = calls.get(callSid);
+    if (c) {
+      c.ended = true;
+      c.call_status = "שיחה חלקית";
+      c.call_status_code = "partial";
+      c.reason = reasonCode || "twilio_stop";
+      const lead = c.lead || {};
+      c.remarks = `מסלול: ${lead.study_track || ""} | סטטוס: ${c.call_status} | caller: ${c.caller_id || ""} | callSid: ${callSid}`;
+      scheduleFinalizeWaitingRecording(callSid);
     }
+
+    // tell Twilio to stop the stream
+    try {
+      twilioWs.close();
+    } catch {}
+
+    try {
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
+    } catch {}
   }
 
   function askNext() {
-    if (state === STATES.CONSENT) {
-      // Opening + consent question
-      speakExact(MB_OPENING_TEXT);
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+
+    if (state === "CONSENT") {
+      ttsExact(openaiWs, MB_OPENING_TEXT);
       return;
     }
-    if (state === STATES.ASK_TRACK) {
-      speakExact("בְּאֵיזֶה מַסְלוּל אַתֶּם מִתְעַנְיְנִים? רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי?");
+    if (state === "ASK_TRACK") {
+      ttsExact(openaiWs, "בְּאֵיזֶה מַסְלוּל אַתֶּם מִתְעַנְיְנִים — רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי?");
       return;
     }
-    if (state === STATES.ASK_FIRST) {
-      speakExact("מָה הַשֵּׁם הַפְּרָטִי שֶׁלָּכֶם?");
+    if (state === "ASK_FIRST") {
+      ttsExact(openaiWs, "מָה הַשֵּׁם הַפְּרָטִי שֶׁלָּכֶם?");
       return;
     }
-    if (state === STATES.ASK_LAST) {
-      speakExact("וּמָה שֵׁם הַמִּשְׁפָּחָה?");
+    if (state === "ASK_LAST") {
+      ttsExact(openaiWs, "וּמָה שֵׁם הַמִּשְׁפָּחָה?");
       return;
     }
-    if (state === STATES.ASK_PHONE_CHOICE) {
-      speakExact("נָכוֹן לַחֲזוֹר אֲלֵיכֶם לַמִּסְפָּר הַמְּזוֹהֶה, אוֹ לְהַשְׁאִיר מִסְפָּר אַחֵר לַחֲזָרָה? אֶפְשָׁר לוֹמַר: מְזוֹהֶה, אוֹ מִסְפָּר אַחֵר.");
+    if (state === "ASK_PHONE_CHOICE") {
+      ttsExact(openaiWs, `לְאֵיזֶה מִסְפָּר תִּרְצוּ שֶׁנַּחֲזֹר?
+אֶפְשָׁר לוֹמַר "לַמִּסְפָּר הַמְּזֻהֶה", אוֹ לְהַקְרִיא מִסְפָּר אֶחָד.`);
       return;
     }
-    if (state === STATES.ASK_PHONE) {
-      speakExact("בְּאֵיזֶה מִסְפָּר טֶלֶפוֹן נוֹחַ שֶׁנַּחֲזֹר אֲלֵיכֶם?");
+    if (state === "ASK_PHONE") {
+      ttsExact(openaiWs, "בְּסֵדֶר. אֲנָא הַקְרִיאוּ אֶת מִסְפָּר הַטֶּלֶפוֹן לַחֲזָרָה.");
       return;
     }
-    if (state === STATES.DONE) {
-      speakExact(MB_CLOSING_TEXT);
-      const s = sessions.get(callSid);
-      if (s) s.completed = true;
+    if (state === "DONE") {
+      ttsExact(openaiWs, MB_CLOSING_TEXT);
+      // small delay then hangup
+      setTimeout(() => endCall("flow_done"), 1200);
       return;
     }
   }
 
-  function handleUserText(raw) {
-    const text = String(raw || "").trim();
-    if (!text) return;
+  function handleUserText(userText) {
+    lastUserHeardAt = Date.now();
+    const t = normalizeText(userText);
 
-    // If user asks "מי אתה" / refuses / jokes — short generic response, then repeat current question.
-    const low = text.toLowerCase();
+    // "התחכמויות" / שאלות כלליות — תשובה קצרה ולחזור לשאלה
+    const lower = t.toLowerCase();
     if (
-      /מי אתה|מי את|מה זה|לא רוצה|עזוב|עזבו|לא מעוניין|לא מעוניינת|לא בא לי/.test(text) ||
-      /who are you|dont want|don'?t want|no thanks/.test(low)
+      lower.includes("מי אתה") || lower.includes("מי את") ||
+      lower.includes("מה אתה") || lower.includes("מה את") ||
+      lower.includes("לא רוצה להשאיר") || lower.includes("לא רוצה פרטים") ||
+      lower.includes("bye") || lower.includes("goodbye")
     ) {
-      speakExact("אֲנִי מַעֲרֶכֶת רִישּׁוּם בִּלְבַד. נָצִיג יַחֲזֹר אֲלֵיכֶם עִם כָּל הַהֶסְבֵּרִים. בּוֹאוּ נַשְׁלִים רַק אֶת הַפְּרָטִים הַבְּסִיסִיִּים.");
-      // after it finishes, we will askNext() again on response.done
-      return;
-    }
-
-    if (state === STATES.CONSENT) {
-      // Expect yes/no
-      if (/^כן$|^כֵּן$|כן\s|^ok$|^okay$|^yes$/i.test(text)) {
-        state = STATES.ASK_TRACK;
-      } else if (/^לא$|^לֹא$|^no$/i.test(text)) {
-        // user declines
-        state = STATES.DONE;
-      } else {
-        speakExact('רַק לוֹדֵא: אֶפְשָׁר לַעֲנוֹת רַק "כֵּן" אוֹ "לֹא". זֶה בְּסֵדֶר מִבַּחִינַתְכֶם?');
-        return;
+      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+        ttsExact(openaiWs, "אֲנִי מַעֲרֶכֶת רִישּׁוּם בִּלְבַד. נָצִיג יַחֲזֹר אֲלֵיכֶם עִם כָּל הַהֶסְבֵּרִים.");
+        setTimeout(() => askNext(), 600);
       }
       return;
     }
 
-    if (state === STATES.ASK_TRACK) {
-      const track = normalizeTrack(text);
-      if (!track) {
-        speakExact("אֶפְשָׁר לִבְחוֹר אֶחָד מִשְּׁלוֹשֶׁת הַמַּסְלוּלִים: רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי.");
-        return;
-      }
-      lead.study_track = track;
-      state = STATES.ASK_FIRST;
-      return;
-    }
-
-    if (state === STATES.ASK_FIRST) {
-      // Take first token as first name (simple)
-      const fn = text.split(/\s+/)[0].slice(0, 40);
-      if (!fn) {
-        speakExact("לֹא קָלַטְנוּ. מָה הַשֵּׁם הַפְּרָטִי שֶׁלָּכֶם?");
-        return;
-      }
-      lead.first_name = fn;
-      state = STATES.ASK_LAST;
-      return;
-    }
-
-    if (state === STATES.ASK_LAST) {
-      const ln = text.split(/\s+/)[0].slice(0, 60);
-      if (!ln) {
-        speakExact("לֹא קָלַטְנוּ. מָה שֵׁם הַמִּשְׁפָּחָה?");
-        return;
-      }
-      lead.last_name = ln;
-      state = STATES.ASK_PHONE_CHOICE;
-      return;
-    }
-
-    if (state === STATES.ASK_PHONE_CHOICE) {
-      if (/מזוהה|מְזוֹהֶה|המספר המזוהה|מְסֻפָּר מְזוֹהֶה/.test(text)) {
-        // Use caller id if available
-        const digits = String(caller || "").replace(/\D/g, "");
-        if (digits.length >= 9) {
-          lead.phone_number = digits;
-          state = STATES.DONE;
-          return;
+    if (state === "CONSENT") {
+      if (isYes(t)) {
+        state = "ASK_TRACK";
+        askNext();
+      } else if (isNo(t)) {
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          ttsExact(openaiWs, "הַבָּנְתִּי. בְּלִי אִשּׁוּר לֹא נוּכַל לְהַמְשִׁיךְ. יוֹם טוֹב.");
+          setTimeout(() => endCall("no_consent"), 900);
         }
-        // If caller id missing, fallback to asking phone
-        state = STATES.ASK_PHONE;
-        return;
+      } else {
+        // reprompt
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          ttsExact(openaiWs, "רַק לוֹדֵא: זֶה בְּסֵדֶר מִבַּחִינַתְכֶם? אֶפְשָׁר לַעֲנוֹת רַק כֵּן אוֹ לֹא.");
+        }
       }
-      // If user says "another number"
-      if (/אחר|אַחֵר|מספר אחר|מִסְפָּר אַחֵר/.test(text)) {
-        state = STATES.ASK_PHONE;
-        return;
-      }
-      speakExact('אֶפְשָׁר לוֹמַר רַק: "מְזוֹהֶה" אוֹ "מִסְפָּר אַחֵר".');
       return;
     }
 
-    if (state === STATES.ASK_PHONE) {
-      const digits = text.replace(/\D/g, "");
-      if (!isHebrewDigitsPhone(digits)) {
-        speakExact("הַמִּסְפָּר לֹא נִרְאֶה תָּקִין. בַּקָּשָׁה לְהַגִּיד מִסְפָּר טֶלֶפוֹן שֶׁל 9 אוֹ 10 סְפָרוֹת.");
+    if (state === "ASK_TRACK") {
+      const track = detectTrack(t);
+      if (track) {
+        setLeadField("study_track", track);
+        state = "ASK_FIRST";
+        askNext();
+      } else {
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          ttsExact(openaiWs, "אֶפְשָׁר לִבְחֹר אֶחָד מִשְּׁלֹשָׁה: רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי.");
+          setTimeout(() => askNext(), 500);
+        }
+      }
+      return;
+    }
+
+    if (state === "ASK_FIRST") {
+      // prevent phone mistaken as name
+      const maybePhone = extractPhone(t);
+      if (maybePhone) {
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          ttsExact(openaiWs, "תּוֹדָה. רַק קֹדֶם — מָה הַשֵּׁם הַפְּרָטִי שֶׁלָּכֶם?");
+        }
         return;
       }
-      lead.phone_number = digits;
-      state = STATES.DONE;
+      setLeadField("first_name", t);
+      state = "ASK_LAST";
+      askNext();
+      return;
+    }
+
+    if (state === "ASK_LAST") {
+      const maybePhone = extractPhone(t);
+      if (maybePhone) {
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          ttsExact(openaiWs, "רַק שֵׁם מִשְׁפָּחָה בַּשָּׁלָב הַזֶּה, בְּבַקָּשָׁה.");
+        }
+        return;
+      }
+      setLeadField("last_name", t);
+      state = "ASK_PHONE_CHOICE";
+      askNext();
+      return;
+    }
+
+    if (state === "ASK_PHONE_CHOICE") {
+      if (lower.includes("מזוהה") || lower.includes("המספר המזוהה") || lower.includes("למזוהה")) {
+        // use caller id
+        setLeadField("phone_number", (caller || "").replace(/\D/g, ""));
+        state = "DONE";
+        askNext();
+        return;
+      }
+      const p = extractPhone(t);
+      if (p) {
+        setLeadField("phone_number", p);
+        state = "DONE";
+        askNext();
+      } else {
+        state = "ASK_PHONE";
+        askNext();
+      }
+      return;
+    }
+
+    if (state === "ASK_PHONE") {
+      const p = extractPhone(t);
+      if (p) {
+        setLeadField("phone_number", p);
+        state = "DONE";
+        askNext();
+      } else {
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          ttsExact(openaiWs, "לֹא הִצְלַחְתִּי לִקְלֹט מִסְפָּר. אֲנָא הַקְרִיאוּ שׁוּב לְאַט וּבְרֹרוּת.");
+        }
+      }
       return;
     }
   }
 
-  // OpenAI WS lifecycle
-  openAiWs.on("open", async () => {
-    openAiReady = true;
-    sendToOpenAI(buildSessionUpdate());
-    flushOpenAIQueue();
+  // ---- Timers (idle + max call) ----
+  const interval = setInterval(() => {
+    const now = Date.now();
 
-    // after session update, ask opening
-    // we call askNext() only after we have callSid (from Twilio "start")
-  });
-
-  openAiWs.on("message", (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
+    if (now - callStartedAt > MB_MAX_CALL_MS) {
+      ensureCallRecord();
+      const c = calls.get(callSid);
+      if (c) {
+        c.call_status = "שיחה חלקית";
+        c.call_status_code = "partial";
+        c.reason = "max_call_timeout";
+        c.remarks = `Timeout max call | caller: ${caller} | callSid: ${callSid}`;
+      }
+      endCall("max_call_timeout");
       return;
     }
 
-    if (MB_DEBUG && msg?.type?.startsWith("error")) {
-      err("OpenAI error", msg);
+    const idleFor = now - lastUserHeardAt;
+    if (!idleWarningSent && idleFor > MB_IDLE_WARNING_MS && openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+      idleWarningSent = true;
+      ttsExact(openaiWs, "רַק בּוֹדֵק — אַתֶּם אִתָּנוּ?");
     }
-
-    // When OpenAI returns transcript:
-    if (msg.type === "conversation.item.input_audio_transcription.completed") {
-      const userText = msg.transcript || "";
-      if (MB_DEBUG) log("USER>", userText);
-      handleUserText(userText);
-      return;
+    if (idleFor > MB_IDLE_HANGUP_MS) {
+      ensureCallRecord();
+      const c = calls.get(callSid);
+      if (c) {
+        c.call_status = "שיחה חלקית";
+        c.call_status_code = "partial";
+        c.reason = "idle_timeout";
+        c.remarks = `Idle timeout | caller: ${caller} | callSid: ${callSid}`;
+      }
+      endCall("idle_timeout");
     }
+  }, 500);
 
-    // When response done, unlock and continue flow
-    if (msg.type === "response.done") {
-      activeResponse = false;
+  // ---- Twilio WS messages ----
+  twilioWs.on("message", async (msg) => {
+    let data;
+    try { data = JSON.parse(msg); } catch { return; }
 
-      // advance flow deterministically after bot speaks
-      // CONSENT: after opening spoken, we want to actually wait user answer, but we keep state CONSENT
-      // Others: after user input updates state, we ask next question here
-      if (state === STATES.CONSENT) {
-        // After opening prompt, we must ask the consent question is already included in MB_OPENING_TEXT (should end with question)
-        // so do nothing
-        return;
+    if (data.event === "start") {
+      streamSid = data.start.streamSid || "";
+      callSid = data.start.callSid || "";
+      // Custom params
+      const params = data.start.customParameters || {};
+      caller = params.caller || "";
+      called = params.called || "";
+      source = params.source || source;
+
+      log("[INFO] CALL start", { streamSid, callSid, caller, called });
+
+      // create call record
+      ensureCallRecord();
+
+      // start recording (optional)
+      if (MB_ENABLE_RECORDING && TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && callSid) {
+        try {
+          const client = Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+          const rec = await client.calls(callSid).recordings.create({
+            recordingStatusCallback: MB_RECORDING_STATUS_CALLBACK_URL || undefined,
+            recordingStatusCallbackMethod: "POST",
+          });
+          log("[INFO] RECORDING>", { ok: true, reason: "recording_started", sid: rec.sid });
+        } catch (e) {
+          log("[WARN] RECORDING start failed", String(e));
+        }
       }
 
-      // Ask next question / closing
-      askNext();
+      // OpenAI connect per call
+      try {
+        openaiWs = openaiWsConnect();
+
+        openaiWs.on("open", () => {
+          if (MB_DEBUG) log("[DEBUG] OpenAI WS open");
+
+          // session.update (Realtime GA)
+          sendOpenAi(openaiWs, {
+            type: "session.update",
+            session: {
+              type: "realtime",
+              model: OPENAI_MODEL,
+              instructions: buildSystemPrompt(),
+              temperature: 0.7, // ✅ must be >= 0.6
+              modalities: ["audio", "text"], // ✅ correct
+              audio: {
+                output: { voice: OPENAI_VOICE }
+              },
+              turn_detection: {
+                type: "server_vad",
+                threshold: MB_VAD_THRESHOLD,
+                prefix_padding_ms: MB_VAD_PREFIX_MS,
+                silence_duration_ms: MB_VAD_SILENCE_MS,
+                suffix_padding_ms: MB_VAD_SUFFIX_MS
+              }
+            }
+          });
+
+          // Start the flow
+          state = "CONSENT";
+          askNext();
+        });
+
+        openaiWs.on("message", (raw) => {
+          let evt;
+          try { evt = JSON.parse(raw); } catch { return; }
+
+          // stream audio deltas back to Twilio
+          if (evt.type === "response.output_audio.delta" && evt.delta) {
+            // Twilio expects base64 mu-law chunks
+            twilioWs.send(JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: evt.delta }
+            }));
+          }
+
+          // user transcription comes via output_audio_transcript (when model transcribes) OR input transcription events depending on config
+          if (evt.type === "response.output_audio_transcript.done" && evt.transcript) {
+            const userText = String(evt.transcript || "").trim();
+            if (userText) {
+              log("[INFO] USER>", userText);
+              handleUserText(userText);
+            }
+          }
+
+          if (evt.type === "error") {
+            log("[ERROR] OpenAI error", evt);
+            // do not spam make; just end gracefully
+            endCall("openai_error");
+          }
+        });
+
+        openaiWs.on("close", () => {
+          if (MB_DEBUG) log("[DEBUG] OpenAI WS closed");
+        });
+
+      } catch (e) {
+        log("[ERROR] failed to init OpenAI WS", String(e));
+        endCall("openai_connect_failed");
+      }
+
       return;
     }
-  });
 
-  openAiWs.on("close", () => {
-    openAiReady = false;
-  });
+    if (data.event === "media") {
+      // audio from Twilio -> OpenAI
+      if (!openaiWs) return;
+      if (openaiWs.readyState !== WebSocket.OPEN) return;
 
-  openAiWs.on("error", (e) => {
-    err("OpenAI WS error", String(e?.message || e));
-  });
-
-  // Twilio -> Server WS lifecycle
-  twilioWs.on("message", async (message) => {
-    let msg;
-    try {
-      msg = JSON.parse(message.toString());
-    } catch {
-      return;
-    }
-
-    if (msg.event === "start") {
-      streamSid = msg.start?.streamSid || "";
-      callSid = msg.start?.callSid || "";
-      caller = msg.start?.customParameters?.caller || msg.start?.caller || "";
-      called = msg.start?.customParameters?.called || msg.start?.called || "";
-      source = msg.start?.customParameters?.source || source;
-
-      log("CALL start", { streamSid, callSid, caller, called });
-
-      ensureSessionCreated();
-
-      // start recording ASAP (optional)
-      await startRecordingIfEnabled();
-
-      // now that we have callSid, say opening
-      // BUT only if OpenAI is ready; otherwise queued.
-      state = STATES.CONSENT;
-      askNext();
-      return;
-    }
-
-    // Media event audio -> forward to OpenAI
-    if (msg.event === "media") {
-      const payload = msg.media?.payload;
-      if (!payload) return;
-
-      // Forward audio to OpenAI input buffer
-      sendToOpenAI({
+      // append audio to OpenAI input buffer
+      sendOpenAi(openaiWs, {
         type: "input_audio_buffer.append",
-        audio: payload,
+        audio: data.media.payload
       });
 
-      // If you have a stuck active response and user speaks, do NOT spam cancel unless activeResponse
-      // (prevents response_cancel_not_active spam)
-      if (activeResponse) {
-        sendToOpenAI({ type: "response.cancel" });
-        activeResponse = false;
-      }
       return;
     }
 
-    if (msg.event === "stop") {
-      const s = sessions.get(callSid);
-      if (s) {
-        // completed only if got all required fields
-        s.completed = Boolean(lead.first_name && lead.last_name && lead.phone_number && lead.study_track);
+    if (data.event === "stop") {
+      // call ended
+      ensureCallRecord();
+      const c = calls.get(callSid);
+      if (c) {
+        c.ended = true;
+        c.call_status = "שיחה חלקית";
+        c.call_status_code = "partial";
+        c.reason = "twilio_stop";
+        const lead = c.lead || {};
+        c.remarks = `מסלול: ${lead.study_track || ""} | סטטוס: ${c.call_status} | caller: ${c.caller_id || ""} | callSid: ${callSid}`;
       }
-      await finalizeAndSend(callSid, "twilio_stop");
+
+      // ✅ Send to Make only once, at end (and wait for recording if needed)
+      scheduleFinalizeWaitingRecording(callSid);
+
+      try { if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
+      try { twilioWs.close(); } catch {}
       return;
     }
   });
 
-  twilioWs.on("close", async () => {
-    const s = sessions.get(callSid);
-    if (s) {
-      s.completed = Boolean(lead.first_name && lead.last_name && lead.phone_number && lead.study_track);
+  twilioWs.on("close", () => {
+    clearInterval(interval);
+    // if Twilio closed unexpectedly, mark ended and finalize once
+    if (callSid) {
+      ensureCallRecord();
+      const c = calls.get(callSid);
+      if (c && !c.ended) {
+        c.ended = true;
+        c.call_status = "שיחה חלקית";
+        c.call_status_code = "partial";
+        c.reason = "twilio_ws_close";
+        scheduleFinalizeWaitingRecording(callSid);
+      }
     }
-    await finalizeAndSend(callSid, "ws_close");
-    try {
-      openAiWs.close();
-    } catch {}
+    try { if (openaiWs && openaiWs.readyState === WebSocket.OPEN) openaiWs.close(); } catch {}
   });
 
   twilioWs.on("error", (e) => {
-    err("Twilio WS error", String(e?.message || e));
+    if (MB_DEBUG) log("[DEBUG] Twilio WS error", String(e));
   });
-});
-
-server.listen(PORT, () => {
-  log(`✅ Server running on port ${PORT}`);
 });
