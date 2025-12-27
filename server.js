@@ -3,11 +3,9 @@
 // NiceLine / מרכז מל״מ – Voice AI “מוטי”
 // Twilio Media Streams <-> OpenAI Realtime API (WS) on Render
 //
-// חוקים:
-// - משתמשים *רק* בשמות ה-ENV הקיימים אצלכם (MB_* וכו’) — בלי להמציא שמות חדשים.
-// - Flow קשיח (State machine בקוד).
-// - שליחה ל-Make רק בסיום שיחה (lead_final) + recording_update אם צריך.
-// - תיקון קריטי: אין שימוש ב-response.output_modalities (גורם ל-unknown_parameter).
+// FIX קריטי:
+// - מוסיפים "תור דיבור" כדי לא לשלוח response.create חדש בזמן שיש response פעיל,
+//   אחרת מתקבל: conversation_already_has_active_response
 //
 // Dependencies: express, ws
 // Node: 18+ (fetch גלובלי)
@@ -48,7 +46,7 @@ const ENV = {
 
   OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
   OPENAI_VOICE: process.env.OPENAI_VOICE || "cedar",
-  // אצלכם זה כתוב PENAI_REALTIME_MODEL (עם P בהתחלה) — משתמשים בזה בדיוק
+  // אצלכם זה PENAI_REALTIME_MODEL (ככה כתוב) — משתמשים בזה בדיוק
   PENAI_REALTIME_MODEL: process.env.PENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28",
 
   // אצלכם PUBLIC_BASE_URL כבר כולל /twilio-recording-callback
@@ -130,8 +128,6 @@ async function postJson(url, payload) {
 }
 
 function getSystemPromptFromMBConversationPrompt() {
-  // MB_CONVERSATION_PROMPT אצלכם הוא JSON עם { "system": "..." }
-  // אם לא JSON / אין system — נחזיר את כל הטקסט כפרומפט.
   const raw = ENV.MB_CONVERSATION_PROMPT || "";
   if (!raw.trim()) return "";
 
@@ -195,7 +191,6 @@ async function startRecordingIfEnabled(callSid) {
     return { ok: false, reason: "recording_env_missing" };
   }
 
-  // אצלכם PUBLIC_BASE_URL הוא כבר callback URL מלא (כולל /twilio-recording-callback)
   const cbUrl = ENV.PUBLIC_BASE_URL;
 
   const url = `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
@@ -223,7 +218,6 @@ async function startRecordingIfEnabled(callSid) {
 }
 
 async function hangupCall(callSid) {
-  // ניתוק יזום אחרי grace (כדי שלא תישאר שיחה על Pause)
   if (!ENV.TWILIO_ACCOUNT_SID || !ENV.TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
 
   const url = `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
@@ -258,7 +252,6 @@ app.post("/twilio-recording-callback", async (req, res) => {
     if (recordingSid) c.recordingSid = recordingSid;
     if (recordingUrl) c.recordingUrl = recordingUrl;
 
-    // אם כבר נשלח FINAL בלי recording_url — שולחים עדכון נוסף
     if (c.finalSent && recordingUrl) {
       const payload = {
         update_type: "recording_update",
@@ -325,7 +318,6 @@ const server = app.listen(PORT, () => {
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (twilioWs) => {
-  // per-connection (per-call) vars
   let streamSid = "";
   let callSid = "";
   let caller = "";
@@ -364,15 +356,13 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_IDLE_WARNING_MS > 0) {
       if (idleWarnTimer) clearTimeout(idleWarnTimer);
       idleWarnTimer = setTimeout(() => {
-        // אזהרה עדינה
-        sayExact("רַק לְוַדֵּא שֶׁאַתֶּם עִמָּנוּ. אֶשְׂמַח שֶׁתַּעֲנוּ לַשְּׁאֵלָה.");
-        askCurrentQuestion();
+        sayQueue("רַק לְוַדֵּא שֶׁאַתֶּם עִמָּנוּ. אֶשְׂמַח שֶׁתַּעֲנוּ לַשְּׁאֵלָה.");
+        askCurrentQuestionQueued();
       }, ENV.MB_IDLE_WARNING_MS);
     }
     if (ENV.MB_IDLE_HANGUP_MS > 0) {
       if (idleHangTimer) clearTimeout(idleHangTimer);
       idleHangTimer = setTimeout(async () => {
-        // סגירה + ניתוק + FINAL
         await finishCall("idle_timeout");
       }, ENV.MB_IDLE_HANGUP_MS);
     }
@@ -382,8 +372,8 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_MAX_CALL_MS > 0 && ENV.MB_MAX_WARN_BEFORE_MS > 0) {
       const warnAt = Math.max(0, ENV.MB_MAX_CALL_MS - ENV.MB_MAX_WARN_BEFORE_MS);
       maxCallWarnTimer = setTimeout(() => {
-        sayExact("לְפָנֵי שֶׁנְּסַיֵּם, אֶשְׂמַח לְקַבֵּל אֶת הַפְּרָטִים הַחֲסֵרִים.");
-        askCurrentQuestion();
+        sayQueue("לְפָנֵי שֶׁנְּסַיֵּם, אֶשְׂמַח לְקַבֵּל אֶת הַפְּרָטִים הַחֲסֵרִים.");
+        askCurrentQuestionQueued();
       }, warnAt);
     }
     if (ENV.MB_MAX_CALL_MS > 0) {
@@ -393,7 +383,7 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
-  // OpenAI WS
+  // -------------------- OpenAI WS --------------------
   const openaiWs = new WebSocket(openaiWsUrl(), {
     headers: {
       Authorization: `Bearer ${ENV.OPENAI_API_KEY}`,
@@ -421,9 +411,28 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_LOG_BOT) logInfo("BOT>", text);
   }
 
-  function sayExact(text) {
-    // ✅ תיקון קריטי: אין response.output_modalities בכלל (זה מה שהפיל אתכם)
+  // ---------- Speech queue (FIX for active response collision) ----------
+  let responseActive = false;
+  const speechQueue = [];
+
+  function tryDequeueSpeech() {
+    if (!openaiReady) return;
+    if (responseActive) return;
+    if (speechQueue.length === 0) return;
+
+    const nextText = speechQueue.shift();
+    responseActive = true;
+    createResponse(nextText);
+  }
+
+  function sayQueue(text) {
     botLog(text);
+    speechQueue.push(text);
+    tryDequeueSpeech();
+  }
+
+  function createResponse(text) {
+    // IMPORTANT: no response.output_modalities
     sendOpenAI({
       type: "response.create",
       response: {
@@ -436,34 +445,34 @@ wss.on("connection", (twilioWs) => {
     });
   }
 
-  function askCurrentQuestion() {
+  function askCurrentQuestionQueued() {
     if (state === STATES.ASK_TRACK) {
-      sayExact("בְּאֵיזֶה מַסְלוּל אַתֶּם מִתְעַנְיְנִים? רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי?");
+      sayQueue("בְּאֵיזֶה מַסְלוּל אַתֶּם מִתְעַנְיְנִים? רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי?");
       return;
     }
     if (state === STATES.ASK_FIRST) {
-      sayExact("מָה הַשֵּׁם הַפְּרָטִי שֶׁלָּכֶם?");
+      sayQueue("מָה הַשֵּׁם הַפְּרָטִי שֶׁלָּכֶם?");
       return;
     }
     if (state === STATES.ASK_LAST) {
-      sayExact("וּמָה שֵׁם הַמִּשְׁפָּחָה?");
+      sayQueue("וּמָה שֵׁם הַמִּשְׁפָּחָה?");
       return;
     }
     if (state === STATES.ASK_PHONE_CHOICE) {
       if (callerPhoneLocal) {
-        sayExact(
+        sayQueue(
           `לְאֵיזֶה מִסְפָּר נוֹחַ שֶׁנַּחֲזֹר אֲלֵיכֶם? ` +
             `אֶפְשָׁר לְהָגִיד "כֵּן" וְנַחֲזֹר לַמִּסְפָּר הַמְּזֻהֶּה (${callerPhoneLocal}), ` +
             `אוֹ לְהַגִּיד מִסְפָּר אַחֵר.`
         );
       } else {
         state = STATES.ASK_PHONE;
-        askCurrentQuestion();
+        askCurrentQuestionQueued();
       }
       return;
     }
     if (state === STATES.ASK_PHONE) {
-      sayExact("לְאֵיזֶה מִסְפָּר טֶלֶפוֹן נוֹחַ שֶׁנַּחֲזֹר אֲלֵיכֶם? אֲנָא אִמְרוּ רַק סְפָרוֹת.");
+      sayQueue("לְאֵיזֶה מִסְפָּר טֶלֶפוֹן נוֹחַ שֶׁנַּחֲזֹר אֲלֵיכֶם? אֲנָא אִמְרוּ רַק סְפָרוֹת.");
       return;
     }
   }
@@ -471,14 +480,12 @@ wss.on("connection", (twilioWs) => {
   function handleMetaOrRefusal(userText) {
     const t = normalizeHebrewNikudLess(userText);
 
-    // סירוב
     if (t.includes("לא רוצה") || t.includes("לא מעוניין") || t.includes("עזוב") || t.includes("ביי")) {
-      sayExact("בְּסֵדֶר גָּמוּר. יוֹם טוֹב.");
+      sayQueue("בְּסֵדֶר גָּמוּר. יוֹם טוֹב.");
       state = STATES.DONE;
       return true;
     }
 
-    // שאלות/התחכמויות
     if (
       t.includes("מי אתה") ||
       t.includes("מי אתם") ||
@@ -487,8 +494,8 @@ wss.on("connection", (twilioWs) => {
       t.includes("הלכה") ||
       t.includes("מסלול")
     ) {
-      sayExact("אֲנִי מַעֲרֶכֶת רִישּׁוּם בִּלְבַד. נָצִיג יַחֲזֹר אֲלֵיכֶם עִם כָּל הַהֶסְבֵּרִים.");
-      askCurrentQuestion();
+      sayQueue("אֲנִי מַעֲרֶכֶת רִישּׁוּם בִּלְבַד. נָצִיג יַחֲזֹר אֲלֵיכֶם עִם כָּל הַהֶסְבֵּרִים.");
+      askCurrentQuestionQueued();
       return true;
     }
 
@@ -498,25 +505,23 @@ wss.on("connection", (twilioWs) => {
   async function finishCall(reason) {
     if (!callSid) return;
 
-    // אם עדיין לא אמרנו סגיר — אומרים פעם אחת
     if (state !== STATES.DONE) {
       state = STATES.DONE;
-      const closing = ENV.MB_CLOSING_TEXT || "תּוֹדָה רַבָּה, הַפְּרָטִים נִשְׁמְרוּ. נְצִיג הַמֶּרְכָּז יַחֲזֹר אֲלֵיכֶם בְּהֶקְדֵּם. יוֹם טוֹב.";
-      sayExact(closing);
+      const closing =
+        ENV.MB_CLOSING_TEXT ||
+        "תּוֹדָה רַבָּה, הַפְּרָטִים נִשְׁמְרוּ. נְצִיג הַמֶּרְכָּז יַחֲזֹר אֲלֵיכֶם בְּהֶקְדֵּם. יוֹם טוֹב.";
+      sayQueue(closing);
     }
 
-    // שליחה ל-Make אחרי grace
     const c = getCall(callSid);
     if (c.finalTimer) clearTimeout(c.finalTimer);
 
     c.finalTimer = setTimeout(async () => {
       await sendFinal(callSid, reason);
-      // ניתוק בפועל ב-Twilio כדי לא להישאר על Pause
       const h = await hangupCall(callSid);
       dbg("Hangup result", h);
     }, ENV.MB_HANGUP_GRACE_MS);
 
-    // גם סוגרים WSים
     try {
       openaiWs.close();
     } catch {}
@@ -530,7 +535,6 @@ wss.on("connection", (twilioWs) => {
 
     if (ENV.MB_LOG_TRANSCRIPTS) logInfo("USER>", userText);
 
-    // reset idle timers on any user input
     armIdleTimers();
 
     if (handleMetaOrRefusal(userText)) return;
@@ -541,44 +545,48 @@ wss.on("connection", (twilioWs) => {
         if (retries.track >= 1) {
           state = STATES.ASK_FIRST;
           logInfo("[STATE] ASK_TRACK -> ASK_FIRST", { track: "" });
-          askCurrentQuestion();
+          askCurrentQuestionQueued();
           return;
         }
         retries.track += 1;
-        sayExact("אֶפְשָׁר לִבְחוֹר אֶחָד מִשְּׁלֹשֶׁת הַמַּסְלוּלִים: רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי.");
-        askCurrentQuestion();
+
+        // ✅ פה היה השבר: קודם אמרת הבהרה ואז מיד שאלת שוב (2 response.create ברצף)
+        // עכשיו: מכניסים לתור הבהרה + השאלה, בצורה סדרתית.
+        sayQueue("אֶפְשָׁר לִבְחוֹר אֶחָד מִשְּׁלֹשֶׁת הַמַּסְלוּלִים: רַבָּנוּת, דַּיָּנוּת, אוֹ טוֹעֵן רַבָּנִי.");
+        askCurrentQuestionQueued();
         return;
       }
+
       c.lead.study_track = track;
       state = STATES.ASK_FIRST;
       logInfo("[STATE] ASK_TRACK -> ASK_FIRST", { track });
-      askCurrentQuestion();
+      askCurrentQuestionQueued();
       return;
     }
 
     if (state === STATES.ASK_FIRST) {
       const name = safeStr(userText);
       if (!name) {
-        askCurrentQuestion();
+        askCurrentQuestionQueued();
         return;
       }
       c.lead.first_name = name;
       state = STATES.ASK_LAST;
       logInfo("[STATE] ASK_FIRST -> ASK_LAST", { first_name: name });
-      askCurrentQuestion();
+      askCurrentQuestionQueued();
       return;
     }
 
     if (state === STATES.ASK_LAST) {
       const last = safeStr(userText);
       if (!last) {
-        askCurrentQuestion();
+        askCurrentQuestionQueued();
         return;
       }
       c.lead.last_name = last;
       state = STATES.ASK_PHONE_CHOICE;
       logInfo("[STATE] ASK_LAST -> ASK_PHONE_CHOICE", { last_name: last });
-      askCurrentQuestion();
+      askCurrentQuestionQueued();
       return;
     }
 
@@ -591,7 +599,6 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // אם אמר מספר במקום כן/לא
       const d = digitsOnly(userText);
       if (d.length >= 9) {
         state = STATES.ASK_PHONE;
@@ -600,7 +607,7 @@ wss.on("connection", (twilioWs) => {
       }
 
       state = STATES.ASK_PHONE;
-      askCurrentQuestion();
+      askCurrentQuestionQueued();
       return;
     }
 
@@ -613,7 +620,7 @@ wss.on("connection", (twilioWs) => {
           return;
         }
         retries.phone += 1;
-        sayExact("לַצּוֹרֶךְ חֲזָרָה אֲנִי צָרִיךְ מִסְפָּר תַּקִּין בֵּין תֵּשַׁע לְעֶשֶׂר סְפָרוֹת. אֲנָא אִמְרוּ רַק סְפָרוֹת.");
+        sayQueue("לַצּוֹרֶךְ חֲזָרָה אֲנִי צָרִיךְ מִסְפָּר תַּקִּין בֵּין תֵּשַׁע לְעֶשֶׂר סְפָרוֹת. אֲנָא אִמְרוּ רַק סְפָרוֹת.");
         return;
       }
 
@@ -632,7 +639,6 @@ wss.on("connection", (twilioWs) => {
 
     const systemPrompt = getSystemPromptFromMBConversationPrompt();
 
-    // session.update — רק פרמטרים תקינים
     sendOpenAI({
       type: "session.update",
       session: {
@@ -655,11 +661,10 @@ wss.on("connection", (twilioWs) => {
       },
     });
 
-    // אם Twilio כבר ניגן פתיח (opening_played=1) — לא מנגנים שוב
     setTimeout(() => {
       logInfo("[STATE] ASK_TRACK | start");
       state = STATES.ASK_TRACK;
-      askCurrentQuestion();
+      askCurrentQuestionQueued();
       armIdleTimers();
       armMaxCallTimers();
     }, 200);
@@ -679,6 +684,16 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
+    // ✅ response finished -> release lock + next in queue
+    if (msg.type === "response.done") {
+      responseActive = false;
+      // בולם קטן כדי שלא נדרוס אודיו בזנב
+      setTimeout(() => {
+        tryDequeueSpeech();
+      }, Math.max(0, ENV.MB_NO_BARGE_TAIL_MS || 0));
+      return;
+    }
+
     // User transcription
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (msg.transcript || "").trim();
@@ -689,6 +704,13 @@ wss.on("connection", (twilioWs) => {
 
     if (msg.type === "error") {
       logError("OpenAI error", msg);
+
+      // אם זו שגיאת active_response — פשוט משחררים וממשיכים (לא סוגרים שיחה)
+      const code = msg?.error?.code || "";
+      if (code === "conversation_already_has_active_response") {
+        responseActive = false;
+        setTimeout(() => tryDequeueSpeech(), 50);
+      }
       return;
     }
   });
@@ -719,7 +741,6 @@ wss.on("connection", (twilioWs) => {
       called = custom.called || "";
       openingPlayedByTwilio = String(custom.opening_played || "") === "1";
 
-      // local phone from E.164
       callerPhoneLocal = (caller || "").startsWith("+972") ? "0" + caller.slice(4) : digitsOnly(caller);
 
       logInfo("CALL start", { streamSid, callSid, caller, called, callerPhoneLocal });
@@ -734,10 +755,9 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
-      // אם משום מה Twilio לא ניגן פתיח — ננגן פתיח מה-ENV ואז נשאל מסלול
-      // (אבל אצלכם ב-/voice opening_played=1, אז ברוב המקרים זה לא יקרה)
+      // אם Twilio לא ניגן פתיח — ננגן פתיח מה-ENV
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
-        sayExact(ENV.MB_OPENING_TEXT);
+        sayQueue(ENV.MB_OPENING_TEXT);
       }
 
       return;
@@ -758,7 +778,6 @@ wss.on("connection", (twilioWs) => {
 
       clearTimers();
 
-      // אם לא נשלח final עדיין — שולחים אחרי grace קצר (כמו שאתם רוצים)
       if (c.finalTimer) clearTimeout(c.finalTimer);
       c.finalTimer = setTimeout(() => {
         sendFinal(callSid, "twilio_stop").catch(() => {});
