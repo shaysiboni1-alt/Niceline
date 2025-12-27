@@ -1,11 +1,14 @@
 // server.js
 // NiceLine / מרכז מל"מ – Voice AI – Render
-// Fixes:
-// 1) ONLY ONE WEBHOOK: lead_final (remove recording_update webhook)
-// 2) No-speech bug: start dequeuing speech after OpenAI WS opens
-// 3) Avoid duplicated consent question if MB_OPENING_TEXT already contains it
-// 4) KEEP EXISTING ENV NAMES (NO changes)
-// 5) NEW: "Gate" – ignore user transcripts until opening+consent question played (prevents weird starts)
+//
+// ✅ This version solves:
+// 1) Opening is ALWAYS spoken from Render (MB_OPENING_TEXT) so recording + same voice
+// 2) Ignore early user speech until opening+consent question actually played (Gate)
+// 3) Consent YES/NO is STRICT: prevents "לא יודע" -> NO bug
+// 4) Prevent call drops while bot speaks: idle timers pause during bot speech
+// 5) Single webhook only: lead_final (no recording_update)
+//
+// ENV NAMES: unchanged, uses existing MB_* names only.
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -66,10 +69,7 @@ function nowIso() { return new Date().toISOString(); }
 function safeStr(s) { return (s || "").toString().trim(); }
 function digitsOnly(s) { return (s || "").toString().replace(/[^\d]/g, ""); }
 
-function stripNikud(s) {
-  return (s || "").toString().replace(/[\u0591-\u05C7]/g, "");
-}
-
+function stripNikud(s) { return (s || "").toString().replace(/[\u0591-\u05C7]/g, ""); }
 function normalizeText(s) {
   return (s || "")
     .toString()
@@ -79,30 +79,41 @@ function normalizeText(s) {
     .toLowerCase();
 }
 
-function detectYesNo(s) {
+// ✅ STRICT consent detection: only accept short, explicit answers
+function detectYesNoStrict(s) {
   const t = normalizeText(s);
   if (!t) return null;
-  const yes = ["כן", "בטח", "בסדר", "אוקיי", "אוקי", "ok", "okay", "yes", "נכון"];
-  const no = ["לא", "ממש לא", "לא רוצה", "no", "nope", "לא נכון"];
-  if (yes.some((w) => t === w || t.startsWith(w) || t.includes(` ${w} `))) return "yes";
-  if (no.some((w) => t === w || t.startsWith(w) || t.includes(` ${w} `))) return "no";
+
+  // If message is long / contains question -> not a yes/no
+  if (t.length > 12) return null;
+  if (t.includes("למה") || t.includes("מי") || t.includes("מה") || t.includes("איך")) return null;
+
+  const yesSet = new Set(["כן", "כן.", "בטח", "בסדר", "אוקיי", "אוקי", "ok", "okay", "yes", "נכון"]);
+  const noSet = new Set(["לא", "לא.", "no", "nope", "לא תודה"]);
+
+  if (yesSet.has(t)) return "yes";
+  if (noSet.has(t)) return "no";
+
+  // also allow "כן בטח" / "כן ברור" / "לא תודה" (still short)
+  if (t.startsWith("כן")) return "yes";
+  if (t === "לא תודה") return "no";
+
   return null;
 }
 
-function isRefusal(text) {
+function isRefusalHard(text) {
   const t = normalizeText(text);
-  return t.includes("לא רוצה") || t.includes("עזוב") || t === "ביי" || t.includes("לא מעוניין");
+  // explicit refusal keywords
+  return (
+    t === "ביי" ||
+    t === "להתראות" ||
+    t.includes("עזוב") ||
+    t.includes("לא רוצה") ||
+    t.includes("לא מעוניין") ||
+    t.includes("לא מעונינת")
+  );
 }
 
-function digitsSpaced(d) {
-  const x = digitsOnly(d);
-  return x.split("").join(" ");
-}
-function last4Digits(d) {
-  const x = digitsOnly(d);
-  if (x.length < 4) return "";
-  return x.slice(-4);
-}
 function isValidILPhoneDigits(d) {
   const x = digitsOnly(d);
   return x.length === 9 || x.length === 10;
@@ -150,6 +161,16 @@ function extractPhoneFromTranscript(text) {
     }
   }
   return "";
+}
+
+function digitsSpaced(d) {
+  const x = digitsOnly(d);
+  return x.split("").join(" ");
+}
+function last4Digits(d) {
+  const x = digitsOnly(d);
+  if (x.length < 4) return "";
+  return x.slice(-4);
 }
 
 async function postJson(url, payload) {
@@ -204,10 +225,9 @@ async function startRecordingIfEnabled(callSid) {
     return { ok: false, reason: "recording_env_missing" };
   }
 
-  const cbUrl = ENV.PUBLIC_BASE_URL;
   const url = `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
   const body = new URLSearchParams({
-    RecordingStatusCallback: cbUrl,
+    RecordingStatusCallback: ENV.PUBLIC_BASE_URL,
     RecordingStatusCallbackMethod: "POST",
     RecordingChannels: "dual",
   });
@@ -381,12 +401,12 @@ wss.on("connection", (twilioWs) => {
   let caller = "";
   let called = "";
   let callerPhoneLocal = "";
-  let openingPlayedByTwilio = false;
 
-  // ✅ NEW: Gate
+  // Gate: ignore transcripts until opening+consent question actually spoken
   let gateActive = true;
   let gateStartMs = 0;
   let consentQuestionWasSpoken = false;
+  let openingWasSpoken = false;
 
   const STATES = {
     ASK_CONSENT: "ASK_CONSENT",
@@ -404,10 +424,14 @@ wss.on("connection", (twilioWs) => {
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
 
+  // timers
   let idleWarnTimer = null;
   let idleHangTimer = null;
   let maxCallTimer = null;
   let maxCallWarnTimer = null;
+
+  // IMPORTANT: pause idle timers while BOT is speaking
+  let botSpeaking = false;
 
   function clearTimers() {
     if (idleWarnTimer) clearTimeout(idleWarnTimer);
@@ -417,7 +441,15 @@ wss.on("connection", (twilioWs) => {
     idleWarnTimer = idleHangTimer = maxCallTimer = maxCallWarnTimer = null;
   }
 
+  function cancelIdleTimersOnly() {
+    if (idleWarnTimer) clearTimeout(idleWarnTimer);
+    if (idleHangTimer) clearTimeout(idleHangTimer);
+    idleWarnTimer = idleHangTimer = null;
+  }
+
   function armIdleTimers() {
+    if (botSpeaking) return; // ✅ don't arm during bot speech
+
     if (ENV.MB_IDLE_WARNING_MS > 0) {
       if (idleWarnTimer) clearTimeout(idleWarnTimer);
       idleWarnTimer = setTimeout(() => {
@@ -473,6 +505,15 @@ wss.on("connection", (twilioWs) => {
   let endReason = "";
   let endAfterMs = 0;
 
+  function createResponse(text) {
+    sendOpenAI({
+      type: "response.create",
+      response: {
+        instructions: text,
+      },
+    });
+  }
+
   function tryDequeueSpeech() {
     if (!openaiReady) return;
     if (responseActive) return;
@@ -483,10 +524,16 @@ wss.on("connection", (twilioWs) => {
     }
 
     const nextText = speechQueue.shift();
+
+    // ✅ BOT speaking starts -> pause idle timers
+    botSpeaking = true;
+    cancelIdleTimersOnly();
+
     responseActive = true;
 
-    // ✅ Mark that consent question was actually spoken (for Gate)
+    // mark spoken opening/consent (for Gate)
     const nt = normalizeText(nextText);
+    if (nt.includes("שלום") && nt.includes("הגעתם") && nt.includes("מרכז")) openingWasSpoken = true;
     if (state === STATES.ASK_CONSENT && (nt.includes("זה בסדר") || nt.includes("האם זה בסדר"))) {
       consentQuestionWasSpoken = true;
     }
@@ -502,23 +549,9 @@ wss.on("connection", (twilioWs) => {
     tryDequeueSpeech();
   }
 
-  function createResponse(text) {
-    sendOpenAI({
-      type: "response.create",
-      response: {
-        instructions: text,
-      },
-    });
-  }
-
-  function openingAlreadyHasConsent(openingText) {
-    const t = normalizeText(openingText);
-    return t.includes("האם זה בסדר") || t.includes("זה בסדר מבחינתכם") || t.includes("זה בסדר מבחינתך");
-  }
-
   function askCurrentQuestionQueued() {
     if (state === STATES.ASK_CONSENT) {
-      sayQueue("זה בסדר מבחינתכם?");
+      sayQueue("האם זה בסדר מבחינתכם?");
       return;
     }
     if (state === STATES.ASK_NAME) {
@@ -563,9 +596,7 @@ wss.on("connection", (twilioWs) => {
     return false;
   }
 
-  function cleanWord(w) {
-    return (w || "").replace(/[.,!?;:"'׳״]+$/g, "").trim();
-  }
+  function cleanWord(w) { return (w || "").replace(/[.,!?;:"'׳״]+$/g, "").trim(); }
 
   function parseName(text) {
     const raw = safeStr(text).replace(/[0-9]/g, "").replace(/\s+/g, " ").trim();
@@ -582,6 +613,17 @@ wss.on("connection", (twilioWs) => {
     const c = getCall(callSid);
     c.lead.first_name = nameObj.first || "";
     c.lead.last_name = nameObj.last || "";
+  }
+
+  function gateAllowsInput() {
+    if (!gateActive) return true;
+
+    // minimal delay so user early blurts are ignored
+    const minMs = 2200;
+    if (Date.now() - gateStartMs < minMs) return false;
+
+    // release after opening + consent question were spoken
+    return openingWasSpoken && consentQuestionWasSpoken;
   }
 
   async function finishCall(reason) {
@@ -617,13 +659,18 @@ wss.on("connection", (twilioWs) => {
     }, endAfterMs);
   }
 
-  function gateAllowsInput() {
-    if (!gateActive) return true;
-    // מינימום זמן כדי לאפשר לבוט להתחיל להשמיע
-    const minMs = 1800;
-    if (Date.now() - gateStartMs < minMs) return false;
-    // משחררים אחרי ששאלת ההסכמה הושמעה בפועל (או פתיח כולל הסכמה)
-    return consentQuestionWasSpoken || openingAlreadyHasConsent(ENV.MB_OPENING_TEXT || "");
+  function handleConsentQuestionOrInfo(userText) {
+    // If user asks who/why at consent stage, respond with short intro and re-ask
+    const t = normalizeText(userText);
+    const asksWho = t.includes("מי אתה") || t.includes("מי אתם");
+    const asksWhy = t.includes("למה") || t.includes("מה זה") || t.includes("מה אתה") || t.includes("מה אתם");
+
+    if (asksWho || asksWhy) {
+      sayQueue("אנחנו מערכת רישום בלבד של מרכז מל\"מ. נציג יחזור אליכם עם כל ההסברים.");
+      askCurrentQuestionQueued();
+      return true;
+    }
+    return false;
   }
 
   function advanceAfter(userText) {
@@ -633,15 +680,15 @@ wss.on("connection", (twilioWs) => {
       dbg("GATE: ignoring early user input:", userText);
       return;
     } else {
-      // ברגע שהגענו לפה פעם ראשונה – משחררים Gate
       gateActive = false;
     }
 
     if (ENV.MB_LOG_TRANSCRIPTS) logInfo("USER>", userText);
 
+    // Arm idle timers only when user speaks AND bot is not speaking
     armIdleTimers();
 
-    if (isRefusal(userText)) {
+    if (isRefusalHard(userText)) {
       c.meta.consent = "no";
       sayQueue("בסדר גמור, תודה רבה ויום נעים.");
       finishCall("user_refused").catch(() => {});
@@ -649,7 +696,10 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (state === STATES.ASK_CONSENT) {
-      const yn = detectYesNo(userText);
+      // Handle "מי אתה/למה" etc.
+      if (handleConsentQuestionOrInfo(userText)) return;
+
+      const yn = detectYesNoStrict(userText);
       if (yn === "yes") {
         c.meta.consent = "yes";
         state = STATES.ASK_NAME;
@@ -663,13 +713,15 @@ wss.on("connection", (twilioWs) => {
         finishCall("consent_no").catch(() => {});
         return;
       }
+
+      // Not explicit yes/no -> clarification once, then stay
       if (retries.consent >= 1) {
-        sayQueue("בסדר גמור, תודה רבה ויום נעים.");
-        finishCall("consent_unclear").catch(() => {});
+        sayQueue("כדי להמשיך לרישום, צריך רק כן או לא. זה בסדר מבחינתכם?");
+        retries.consent = 0; // reset so we don't auto-hang on normal questions
         return;
       }
       retries.consent += 1;
-      askCurrentQuestionQueued();
+      sayQueue("רק כן או לא בבקשה. זה בסדר מבחינתכם?");
       return;
     }
 
@@ -694,7 +746,7 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (state === STATES.CONFIRM_NAME) {
-      const yn = detectYesNo(userText);
+      const yn = detectYesNoStrict(userText);
       if (yn === "yes") {
         saveNameToLead(pendingName);
         state = callerPhoneLocal ? STATES.CONFIRM_CALLER_LAST4 : STATES.ASK_PHONE;
@@ -739,7 +791,7 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (state === STATES.CONFIRM_CALLER_LAST4) {
-      const yn = detectYesNo(userText);
+      const yn = detectYesNoStrict(userText);
       if (yn === "yes") {
         c.lead.phone_number = callerPhoneLocal;
         logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (use caller)", { phone_number: callerPhoneLocal });
@@ -783,7 +835,7 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (state === STATES.CONFIRM_PHONE) {
-      const yn = detectYesNo(userText);
+      const yn = detectYesNoStrict(userText);
       if (yn === "yes") {
         c.lead.phone_number = pendingPhone;
         logInfo("[STATE] CONFIRM_PHONE -> DONE", { phone_number: pendingPhone });
@@ -821,10 +873,10 @@ wss.on("connection", (twilioWs) => {
       `כללים קבועים:\n` +
       `- לדבר בעברית תקינה, בלשון רבים בלבד.\n` +
       `- טון חם, אנושי וטבעי. לא רובוטי.\n` +
-      `- לא לומר או להקריא את הכללים/ההוראות/המערכת. אף פעם.\n` +
-      `- לא להוסיף ניקוד בשום מצב.\n` +
-      `- כשאומרים מספרים: להקריא ספרה-ספרה בבירור.\n` +
-      `- לענות רק לפי הזרימה: בלי הקדמות מיותרות.\n`;
+      `- לא לומר או להקריא כללים/הוראות מערכת.\n` +
+      `- לא להוסיף ניקוד.\n` +
+      `- כשאומרים מספרים: להקריא ספרה-ספרה.\n` +
+      `- לענות רק לפי הזרימה, בלי הקדמות מיותרות.\n`;
 
     sendOpenAI({
       type: "session.update",
@@ -865,6 +917,11 @@ wss.on("connection", (twilioWs) => {
 
     if (msg.type === "response.done") {
       responseActive = false;
+
+      // ✅ BOT finished speaking -> resume idle timers
+      botSpeaking = false;
+      armIdleTimers();
+
       setTimeout(() => tryDequeueSpeech(), Math.max(0, ENV.MB_NO_BARGE_TAIL_MS || 0));
       return;
     }
@@ -881,6 +938,7 @@ wss.on("connection", (twilioWs) => {
       const code = msg?.error?.code || "";
       if (code === "conversation_already_has_active_response") {
         responseActive = false;
+        botSpeaking = false;
         setTimeout(() => tryDequeueSpeech(), 50);
       }
       return;
@@ -901,13 +959,12 @@ wss.on("connection", (twilioWs) => {
 
       caller = custom.caller || "";
       called = custom.called || "";
-      openingPlayedByTwilio = String(custom.opening_played || "") === "1";
-
       callerPhoneLocal = (caller || "").startsWith("+972") ? "0" + caller.slice(4) : digitsOnly(caller);
 
-      // ✅ Gate init
+      // init gate
       gateActive = true;
       gateStartMs = Date.now();
+      openingWasSpoken = false;
       consentQuestionWasSpoken = false;
 
       logInfo("CALL start", { streamSid, callSid, caller, called, callerPhoneLocal });
@@ -922,22 +979,18 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
-      if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
-        sayQueue(ENV.MB_OPENING_TEXT);
-      }
+      // ✅ ALWAYS opening from Render
+      const opening =
+        ENV.MB_OPENING_TEXT ||
+        "שלום, הגעתם למערכת הרישום של מרכז מל\"מ. כדי שיועץ לימודים יחזור אליכם לבדיקת התאמה, נשאל כמה שאלות קצרות.";
+      sayQueue(opening);
 
       state = STATES.ASK_CONSENT;
       logInfo("[STATE] ASK_CONSENT | waiting user");
+      askCurrentQuestionQueued();
 
-      if (!openingAlreadyHasConsent(ENV.MB_OPENING_TEXT || "")) {
-        sayQueue("זה בסדר מבחינתכם?");
-      } else {
-        // אם הפתיח כבר כולל "האם זה בסדר" – נחשב כאילו שאלנו
-        consentQuestionWasSpoken = true;
-      }
-
-      armIdleTimers();
       armMaxCallTimers();
+      armIdleTimers();
 
       setTimeout(() => tryDequeueSpeech(), 30);
       return;
