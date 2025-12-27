@@ -1,13 +1,13 @@
 // server.js
-// NiceLine – Malam Voice AI (Inbound) – STRICT FLOW + ALL-CALL RECORDING
+// NiceLine – Malam Voice AI (Inbound) – STRICT FLOW + ALL-CALL RECORDING + MAKE RECORDING UPDATE
 // Twilio Media Streams <-> OpenAI Realtime API
 //
-// Features:
-// - Opening / Closing are ENV controlled (MB_OPENING_TEXT / MB_CLOSING_TEXT)
-// - Strict per-call reset
-// - Fix OpenAI Realtime: temperature must be >= 0.6 (set to 0.6)
-// - Start Twilio call recording "ALL CALL" via REST on call start
-// - Receive RecordingUrl via /twilio-recording-callback and send to Make
+// Goals (fixes):
+// - Opening / Closing are ENV controlled (MB_OPENING_TEXT / MB_CLOSING_TEXT) and read VERBATIM (no paraphrase).
+// - Strict per-call reset (no state carry-over).
+// - Prevent "conversation_already_has_active_response" via hard queue + cancel + failsafe.
+// - Start Twilio call recording "ALL CALL" via REST on call start.
+// - Receive RecordingUrl via /twilio-recording-callback and send a SECOND update to Make (same CallSid).
 //
 // npm i express ws dotenv
 // node server.js
@@ -53,23 +53,15 @@ function last4(phoneLocal) {
 }
 function isYes(text) {
   const t = String(text || "").trim().toLowerCase();
-  return ["כן", "כן כן", "בטח", "בוודאי", "נכון", "מאשר", "בסדר", "אוקיי"].some((w) => t === w || t.includes(w));
+  return ["כן", "כן כן", "בטח", "בוודאי", "נכון", "מאשר", "בסדר", "אוקיי", "אוקי", "sure", "yes"].some(
+    (w) => t === w || t.includes(w)
+  );
 }
 function isNo(text) {
   const t = String(text || "").trim().toLowerCase();
-  return ["לא", "לא תודה", "שלילי", "ממש לא", "לא רוצה", "עזוב", "עזבי"].some((w) => t === w || t.includes(w));
-}
-function looksLikeQuestionAboutInfo(text) {
-  const t = String(text || "").trim();
-  if (!t) return false;
-  const patterns = [
-    /מחיר|כמה עולה|תשלום|עלויות/,
-    /תוכן|מה לומדים|סילבוס|שיעורים|רב|מרצה/,
-    /מועדים|תאריך|פתיחה|מתחיל|הרשמה|קורס/,
-    /התאמה|מתאים לי|רמה|דרישות|תנאים/,
-    /\?/,
-  ];
-  return patterns.some((re) => re.test(t));
+  return ["לא", "לא תודה", "שלילי", "ממש לא", "לא רוצה", "עזוב", "עזבי", "no"].some(
+    (w) => t === w || t.includes(w)
+  );
 }
 function safeJsonParse(raw, fallback = null) {
   try {
@@ -128,16 +120,19 @@ const MB_VAD_SUFFIX_MS = envNum("MB_VAD_SUFFIX_MS", 200);
 
 // Barge-in
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
-const MB_NO_BARGE_TAIL_MS = envNum("MB_NO_BARGE_TAIL_MS", 900);
+const MB_NO_BARGE_TAIL_MS = envNum("MB_NO_BARGE_TAIL_MS", 1600);
 
 // Timers
 const MB_IDLE_WARNING_MS = envNum("MB_IDLE_WARNING_MS", 25000);
 const MB_IDLE_HANGUP_MS = envNum("MB_IDLE_HANGUP_MS", 55000);
-const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 3 * 60 * 1000);
-const MB_MAX_WARN_BEFORE_MS = envNum("MB_MAX_WARN_BEFORE_MS", 25000);
+const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 240000);
+const MB_MAX_WARN_BEFORE_MS = envNum("MB_MAX_WARN_BEFORE_MS", 30000);
 
 // Response safety
 const MB_RESPONSE_FAILSAFE_MS = envNum("MB_RESPONSE_FAILSAFE_MS", 12000);
+
+// Temperature: model enforces >= 0.6 (you saw the error when it was 0)
+const OPENAI_TEMPERATURE = Math.max(0.6, envNum("MB_TEMPERATURE", 0.6));
 
 function ilog(...a) { console.log("[INFO]", ...a); }
 function elog(...a) { console.error("[ERROR]", ...a); }
@@ -170,6 +165,34 @@ function getStr(path, def = "") {
   return typeof cur === "string" ? cur : def;
 }
 
+/* ------------------------- Track parsing ------------------------- */
+function parseTrack(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+
+  // Hebrew direct
+  if (/טוען\s*רבני/.test(s) || /טוען-רבני/.test(s)) return "טוען רבני";
+  if (/דיינות/.test(s) || /דיינ/.test(s)) return "דיינות";
+  if (/רבנות/.test(s) || /רבנ/.test(s)) return "רבנות";
+
+  // English-ish (NO broken char-class ranges!)
+  if (/toen|toen\s*rabani|toen\s*rabboni|tollen|tolen|rabani|rabboni/.test(s)) return "טוען רבני";
+  if (/dayanut|dayan(?:u)?t|dayanut|dayanut/.test(s)) return "דיינות";
+  if (/rabbanut|rabba(?:\s|-)?nut|rabb(?:\s|-)?anut|rab(?:\s|-)?anut|rabban(?:\s|-)?ut/.test(s)) return "רבנות";
+
+  return "";
+}
+
+function looksLikeUserTryingToExit(raw) {
+  const t = String(raw || "").trim().toLowerCase();
+  return /לא רוצה|לא מעוניין|עזוב|עזבי|ביי|bye|stop|leave|לא משאיר/.test(t);
+}
+
+function looksLikeMetaQuestion(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return false;
+  return /מי אתה|מי את|מה זה|מה אתם|למה אתם|מה אתם רוצים|\?$/.test(t);
+}
+
 /* ------------------------- Make webhook ------------------------- */
 async function sendToMake(payload) {
   if (!MB_WEBHOOK_URL) return { ok: false, reason: "make_webhook_not_configured" };
@@ -177,7 +200,7 @@ async function sendToMake(payload) {
     const res = await fetchWithTimeout(
       MB_WEBHOOK_URL,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
-      4500
+      7000
     );
     if (!res.ok) return { ok: false, reason: `make_http_${res.status}` };
     return { ok: true, reason: "make_ok" };
@@ -196,18 +219,22 @@ async function startTwilioRecording(callSid) {
   const body = new URLSearchParams({
     RecordingStatusCallback: MB_RECORDING_STATUS_CALLBACK_URL,
     RecordingStatusCallbackEvent: "completed",
-    RecordingStatusCallbackMethod: "POST"
+    RecordingStatusCallbackMethod: "POST",
   });
 
   try {
-    const res = await fetchWithTimeout(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${base64BasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)}`,
-        "Content-Type": "application/x-www-form-urlencoded"
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${base64BasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
       },
-      body
-    }, 6000);
+      9000
+    );
 
     if (!res.ok) return { ok: false, reason: `twilio_rec_http_${res.status}` };
     const json = await res.json();
@@ -217,46 +244,38 @@ async function startTwilioRecording(callSid) {
   }
 }
 
-/* ------------------------- Recording URL store ------------------------- */
-// Store for a short time (calls finish fast). Key = CallSid
-const recordingByCallSid = new Map();
+/* ------------------------- In-memory stores ------------------------- */
+const recordingByCallSid = new Map();      // callSid -> recordingUrl
+const lastPayloadByCallSid = new Map();    // callSid -> last payload sent to Make
+
 function setRecordingUrl(callSid, url) {
   if (!callSid || !url) return;
   recordingByCallSid.set(callSid, url);
-  // auto cleanup after 2 hours
+
+  // cleanup after 2 hours
   setTimeout(() => recordingByCallSid.delete(callSid), 2 * 60 * 60 * 1000).unref?.();
 }
 function getRecordingUrl(callSid) {
   return recordingByCallSid.get(callSid) || "";
 }
+function setLastPayload(callSid, payload) {
+  if (!callSid) return;
+  lastPayloadByCallSid.set(callSid, payload);
+  setTimeout(() => lastPayloadByCallSid.delete(callSid), 2 * 60 * 60 * 1000).unref?.();
+}
+function getLastPayload(callSid) {
+  return lastPayloadByCallSid.get(callSid) || null;
+}
 
 /* ------------------------- Express ------------------------- */
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: false })); // for Twilio form callbacks
+app.use(express.urlencoded({ extended: false })); // Twilio form callbacks
 
 app.get("/health", (_req, res) => res.json({ ok: true, time: nowIso() }));
 
-// Twilio Voice webhook: point your Twilio number to POST https://niceline.onrender.com/twilio-voice
-app.post("/twilio-voice", (req, res) => {
-  // Important: stream uses WSS + your domain
-  const wsUrl = "wss://niceline.onrender.com/twilio-media-stream";
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}">
-      <Parameter name="caller" value="${req.body.From || ""}"/>
-      <Parameter name="called" value="${req.body.To || ""}"/>
-    </Stream>
-  </Connect>
-</Response>`;
-
-  res.type("text/xml").send(twiml);
-});
-
 // Twilio will POST RecordingUrl here when completed
-app.post("/twilio-recording-callback", (req, res) => {
+app.post("/twilio-recording-callback", async (req, res) => {
   const callSid = req.body.CallSid || req.body.callSid || "";
   const recordingUrl = req.body.RecordingUrl || req.body.recordingUrl || "";
 
@@ -264,7 +283,36 @@ app.post("/twilio-recording-callback", (req, res) => {
 
   if (callSid && recordingUrl) {
     setRecordingUrl(callSid, recordingUrl);
+
+    // Send a SECOND update to Make so the row can be updated with recording_url
+    const prev = getLastPayload(callSid);
+    const updatePayload = {
+      update_type: "recording_update",
+      callSid,
+      recording_url: recordingUrl,
+      timestamp: nowIso(),
+
+      // keep these if we have them, to help Make map/update
+      caller_id: prev?.caller_id || "",
+      called: prev?.called || "",
+      streamSid: prev?.streamSid || "",
+      call_status: prev?.call_status || "",
+      call_status_code: prev?.call_status_code || "",
+      source: prev?.source || "Voice AI - Nice Line",
+      first_name: prev?.first_name || "",
+      last_name: prev?.last_name || "",
+      phone_number: prev?.phone_number || "",
+      study_track: prev?.study_track || "",
+    };
+
+    if (MB_WEBHOOK_URL) {
+      ilog("CRM> sending recording update", updatePayload);
+      const r = await sendToMake(updatePayload);
+      ilog("CRM> recording update result", r);
+      if (!r.ok) elog("CRM> recording update FAILED", r);
+    }
   }
+
   res.status(200).send("ok");
 });
 
@@ -273,6 +321,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (twilioWs) => {
+  // --- Per-call variables (STRICT RESET) ---
   let streamSid = "";
   let callSid = "";
   let caller = "";
@@ -281,10 +330,13 @@ wss.on("connection", (twilioWs) => {
 
   const STATES = {
     CONSENT: "CONSENT",
-    ASK_NAME: "ASK_NAME",
+    ASK_TRACK: "ASK_TRACK",
+    ASK_FIRST: "ASK_FIRST",
+    ASK_LAST: "ASK_LAST",
     CONFIRM_CALLER_PHONE: "CONFIRM_CALLER_PHONE",
     ASK_PHONE_MANUAL: "ASK_PHONE_MANUAL",
     CONFIRM_PHONE_MANUAL: "CONFIRM_PHONE_MANUAL",
+    DONE: "DONE",
   };
   let state = STATES.CONSENT;
 
@@ -304,6 +356,7 @@ wss.on("connection", (twilioWs) => {
   const outAudioBuffer = [];
   const MAX_OUT_AUDIO_BUFFER = 600;
 
+  // Hard speech queue + lock (prevents active_response)
   let responseInFlight = false;
   let responseTimer = null;
   const speakQueue = [];
@@ -316,7 +369,7 @@ wss.on("connection", (twilioWs) => {
     source: "Voice AI - Nice Line",
     timestamp: "",
     caller_id: "",
-    called: ""
+    called: "",
   };
 
   function logState(note) { ilog(`[STATE] ${state}${note ? " | " + note : ""}`); }
@@ -336,6 +389,20 @@ wss.on("connection", (twilioWs) => {
     }, MB_RESPONSE_FAILSAFE_MS);
   }
 
+  function openAiSafeSend(obj) {
+    if (!openAiReady) return false;
+    if (!openAiWs || openAiWs.readyState !== WebSocket.OPEN) return false;
+    openAiWs.send(JSON.stringify(obj));
+    return true;
+  }
+
+  // IMPORTANT: We force VERBATIM reading (no paraphrase).
+  function buildVerbatimInstruction(text) {
+    const clean = String(text || "").trim();
+    // Keep it very explicit
+    return `קרא/י עכשיו בדיוק מילה במילה את הטקסט הבא, בלי לשנות, בלי להוסיף, ובלי להחסיר אף תו:\n"""${clean}"""`;
+  }
+
   function pumpSpeakQueue() {
     if (callEnded) return;
     if (!openAiReady) return;
@@ -344,35 +411,49 @@ wss.on("connection", (twilioWs) => {
     if (openAiWs.readyState !== WebSocket.OPEN) return;
 
     const { text, why } = speakQueue.shift();
+    const line = String(text || "").trim();
+    if (!line) return;
+
     responseInFlight = true;
     startInFlightFailsafe();
-    dlog("SPEAK>", why, text);
+    dlog("SPEAK>", why, line);
 
-    openAiWs.send(JSON.stringify({
-      type: "conversation.item.create",
-      item: { type: "message", role: "assistant", content: [{ type: "text", text }] }
-    }));
-    openAiWs.send(JSON.stringify({ type: "response.create" }));
+    // If somehow the model still thinks there's a response, cancel it first
+    openAiSafeSend({ type: "response.cancel" });
+
+    openAiSafeSend({
+      type: "response.create",
+      response: {
+        modalities: ["audio"],
+        instructions: buildVerbatimInstruction(line),
+        max_output_tokens: 180,
+      },
+    });
+
+    logBot(line);
   }
 
   function speakExact(text, why = "speak") {
     const line = String(text || "").trim();
     if (!line) return;
     speakQueue.push({ text: line, why });
-    logBot(line);
     pumpSpeakQueue();
   }
 
   function askCurrent() {
     const qs = CONV.questions || {};
     if (state === STATES.CONSENT) return speakExact(MB_OPENING_TEXT, "opening");
-    if (state === STATES.ASK_NAME) return speakExact(qs.ask_name || "", "ask_name");
+    if (state === STATES.ASK_TRACK) return speakExact(qs.ask_track || "באיזה מסלול אתם מתעניינים? רבנות, דיינות, או טוען רבני?", "ask_track");
+    if (state === STATES.ASK_FIRST) return speakExact(qs.ask_first_name || "מה השם הפרטי שלכם?", "ask_first");
+    if (state === STATES.ASK_LAST) return speakExact(qs.ask_last_name || "ומה שם המשפחה?", "ask_last");
     if (state === STATES.CONFIRM_CALLER_PHONE) {
-      return speakExact(renderTemplate(qs.confirm_caller_phone || "", { last4: last4(callerPhoneLocal) }), "confirm_caller_phone");
+      const tmpl = qs.confirm_caller_phone || "זה המספר שממנו אתם מתקשרים שמסתיים ב־{{last4}}. לחזור אליו?";
+      return speakExact(renderTemplate(tmpl, { last4: last4(callerPhoneLocal) }), "confirm_caller_phone");
     }
-    if (state === STATES.ASK_PHONE_MANUAL) return speakExact(qs.ask_phone_manual || "", "ask_phone_manual");
+    if (state === STATES.ASK_PHONE_MANUAL) return speakExact(qs.ask_phone_manual || "איזה מספר תרצו להשאיר לחזרה? נא לומר ספרות בלבד.", "ask_phone_manual");
     if (state === STATES.CONFIRM_PHONE_MANUAL) {
-      return speakExact(renderTemplate(qs.confirm_phone_manual || "", { phone: digitsOnly(lead.phone_number) }), "confirm_phone_manual");
+      const tmpl = qs.confirm_phone_manual || "רק לוודא: המספר הוא {{phone}}. נכון?";
+      return speakExact(renderTemplate(tmpl, { phone: digitsOnly(lead.phone_number) }), "confirm_phone_manual");
     }
   }
 
@@ -383,6 +464,7 @@ wss.on("connection", (twilioWs) => {
     const recording_url = getRecordingUrl(callSid) || "";
 
     const payload = {
+      update_type: "lead",
       first_name: lead.first_name || "",
       last_name: lead.last_name || "",
       phone_number: lead.phone_number || "",
@@ -390,6 +472,7 @@ wss.on("connection", (twilioWs) => {
       source: lead.source || "Voice AI - Nice Line",
       timestamp: lead.timestamp || nowIso(),
 
+      // HARD RULE: always send caller_id (identified number)
       caller_id: lead.caller_id || caller || "",
       called: lead.called || called || "",
       callSid: callSid || "",
@@ -401,8 +484,12 @@ wss.on("connection", (twilioWs) => {
 
       recording_url,
 
-      remarks: `סטטוס: ${statusHe} | caller: ${lead.caller_id || caller || ""} | callSid: ${callSid || ""}`
+      remarks:
+        `מסלול: ${lead.study_track || ""} | סטטוס: ${statusHe} | caller: ${lead.caller_id || caller || ""} | callSid: ${callSid || ""}`,
     };
+
+    // save for later recording update
+    setLastPayload(callSid, payload);
 
     ilog("CRM> sending", payload);
     const r = await sendToMake(payload);
@@ -413,10 +500,11 @@ wss.on("connection", (twilioWs) => {
   async function finish(statusHe, statusCode, reason, opts = { speakClosing: true }) {
     if (callEnded) return;
     callEnded = true;
+    state = STATES.DONE;
 
     await deliver(statusHe, statusCode, reason);
 
-    if (opts.speakClosing) {
+    if (opts.speakClosing && MB_CLOSING_TEXT) {
       speakExact(MB_CLOSING_TEXT, "closing");
       setTimeout(() => {
         try { openAiWs?.close(); } catch {}
@@ -428,20 +516,21 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
-  function guardrailAndClose() {
-    speakExact(getStr("guardrail", "אנחנו מערכת רישום בלבד. נציג יחזור אליכם עם כל ההסברים. יום טוב."), "guardrail");
-    finish("שיחה חלקית", "partial", "guardrail_question", { speakClosing: false });
+  function guardrailAnswer() {
+    // short + on-script, no free talk
+    return getStr("guardrail", "אנחנו מערכת רישום בלבד. נציג לימודים יחזור אליכם עם כל ההסברים. אפשר להמשיך להשאיר פרטים?");
   }
 
   /* ------------------------- OpenAI Realtime WS ------------------------- */
   const openAiWs = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17", {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" },
   });
 
   openAiWs.on("open", () => {
     openAiReady = true;
 
-    openAiWs.send(JSON.stringify({
+    // Session is per call; we do NOT rely on model free generation, only verbatim TTS responses.
+    openAiSafeSend({
       type: "session.update",
       session: {
         model: "gpt-4o-realtime-preview-2024-12-17",
@@ -451,28 +540,32 @@ wss.on("connection", (twilioWs) => {
         output_audio_format: "g711_ulaw",
         input_audio_transcription: { model: "whisper-1" },
 
-        // IMPORTANT: your model requires temperature >= 0.6
-        temperature: 0.6,
+        temperature: OPENAI_TEMPERATURE,
 
         turn_detection: {
           type: "server_vad",
           threshold: MB_VAD_THRESHOLD,
           silence_duration_ms: MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS,
-          prefix_padding_ms: MB_VAD_PREFIX_MS
+          prefix_padding_ms: MB_VAD_PREFIX_MS,
         },
 
-        max_response_output_tokens: 140,
+        // keep answers short and stable
+        max_response_output_tokens: 120,
+
+        // Hard rules: Hebrew, plural, no email, stick to flow.
         instructions:
           (getStr("system", "") || "") +
-          "\n\nחוקים קשיחים: אתם גבר בשם מוטי. עברית תקינה, לשון רבים בלבד. אין לאסוף אימייל. אין לשנות ניסוחים."
-      }
-    }));
+          "\n\nכללים קשיחים (חובה): עברית תקינה בלבד, לשון רבים בלבד. אין לאסוף אימייל. אין לשנות ניסוחים של שאלות/פתיח/סגיר. לא לענות תשובות חופשיות – רק הקראה של הטקסט שניתן לך.",
+      },
+    });
 
+    // Flush buffered audio
     while (inAudioBuffer.length) {
       const b64 = inAudioBuffer.shift();
-      openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+      openAiSafeSend({ type: "input_audio_buffer.append", audio: b64 });
     }
 
+    // Start fresh
     state = STATES.CONSENT;
     logState("start");
     askCurrent();
@@ -482,6 +575,7 @@ wss.on("connection", (twilioWs) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
+    // Audio streaming back to Twilio
     if (msg.type === "response.audio.delta") {
       botSpeaking = true;
       noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
@@ -491,31 +585,48 @@ wss.on("connection", (twilioWs) => {
         if (outAudioBuffer.length > MAX_OUT_AUDIO_BUFFER) outAudioBuffer.shift();
         return;
       }
-      twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
+      try {
+        twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
+      } catch {}
       return;
     }
 
-    if (msg.type === "response.audio.done" || msg.type === "response.done" || msg.type === "response.completed") {
+    // Any completion event -> release lock
+    if (
+      msg.type === "response.audio.done" ||
+      msg.type === "response.done" ||
+      msg.type === "response.completed" ||
+      msg.type === "response.output_item.done"
+    ) {
       botSpeaking = false;
       clearInFlight();
       pumpSpeakQueue();
       return;
     }
 
+    // STT transcript from user
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const userText = (msg.transcript || "").trim();
       if (!userText || callEnded) return;
 
       logUser(userText);
 
-      if (looksLikeQuestionAboutInfo(userText)) {
-        guardrailAndClose();
+      if (looksLikeUserTryingToExit(userText)) {
+        await finish("שיחה חלקית", "partial", "user_exit", { speakClosing: false });
         return;
       }
 
+      if (looksLikeMetaQuestion(userText)) {
+        // short guardrail and continue the flow
+        speakExact(guardrailAnswer(), "guardrail_meta");
+        // do NOT change state
+        return;
+      }
+
+      // FLOW
       if (state === STATES.CONSENT) {
         if (isYes(userText)) {
-          state = STATES.ASK_NAME;
+          state = STATES.ASK_TRACK;
           logState("yes");
           askCurrent();
           return;
@@ -524,12 +635,44 @@ wss.on("connection", (twilioWs) => {
           await finish("שיחה חלקית", "not_interested", "consent_no", { speakClosing: false });
           return;
         }
-        speakExact(getStr("consent_retry", "רק לוודא: זה בסדר מבחינתכם? אפשר לענות כן או לא."), "consent_retry");
+        speakExact(getStr("consent_retry", "רק לוודא: זה בסדר מבחינתכם? אפשר לענות רק כן או לא."), "consent_retry");
         return;
       }
 
-      if (state === STATES.ASK_NAME) {
+      if (state === STATES.ASK_TRACK) {
+        const tr = parseTrack(userText);
+        if (!tr) {
+          speakExact(getStr("track_retry", "אפשר לבחור אחד משלושת המסלולים: רבנות, דיינות, או טוען רבני. באיזה מסלול אתם מתעניינים?"), "track_retry");
+          return;
+        }
+        lead.study_track = tr;
+        state = STATES.ASK_FIRST;
+        logState("got_track");
+        askCurrent();
+        return;
+      }
+
+      if (state === STATES.ASK_FIRST) {
+        // prevent phone mistaken as first name
+        const maybePhone = normalizeIsraeliPhone(userText, "");
+        if (maybePhone) {
+          speakExact(getStr("first_name_retry", "רק השם הפרטי בבקשה (לא מספר). איך קוראים לכם?"), "first_name_retry");
+          return;
+        }
         lead.first_name = userText;
+        state = STATES.ASK_LAST;
+        logState("got_first");
+        askCurrent();
+        return;
+      }
+
+      if (state === STATES.ASK_LAST) {
+        const maybePhone = normalizeIsraeliPhone(userText, "");
+        if (maybePhone) {
+          speakExact(getStr("last_name_retry", "רק שם משפחה בבקשה (לא מספר). מה שם המשפחה?"), "last_name_retry");
+          return;
+        }
+        lead.last_name = userText;
 
         callerPhoneLocal = normalizeIsraeliPhone("", caller) || "";
         if (callerPhoneLocal) {
@@ -556,14 +699,14 @@ wss.on("connection", (twilioWs) => {
           askCurrent();
           return;
         }
-        speakExact(getStr("questions.confirm_caller_phone_retry", "אפשר לענות רק כן או לא. זה המספר הנכון?"), "confirm_retry");
+        speakExact(getStr("confirm_yesno_retry", "אפשר לענות רק כן או לא. לחזור למספר הזה?"), "confirm_yesno_retry");
         return;
       }
 
       if (state === STATES.ASK_PHONE_MANUAL) {
         const p = normalizeIsraeliPhone(userText, "");
         if (!p) {
-          speakExact(getStr("questions.phone_retry", "סליחה, צריך מספר תקין בספרות בלבד. ננסה שוב."), "phone_retry");
+          speakExact(getStr("phone_retry", "סליחה, צריך מספר ישראלי תקין בספרות בלבד. ננסה שוב."), "phone_retry");
           return;
         }
         lead.phone_number = p;
@@ -584,7 +727,7 @@ wss.on("connection", (twilioWs) => {
           askCurrent();
           return;
         }
-        speakExact(getStr("questions.confirm_phone_manual_retry", "אפשר לענות רק כן או לא. המספר נכון?"), "confirm_manual_retry");
+        speakExact(getStr("confirm_yesno_retry", "אפשר לענות רק כן או לא. המספר נכון?"), "confirm_yesno_retry");
         return;
       }
     }
@@ -592,7 +735,14 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "error") {
       const code = msg?.error?.code;
       elog("OpenAI error", msg);
-      if (code === "conversation_already_has_active_response") return;
+
+      // If we hit "active_response", we just release the lock and continue the queue (and we also cancel before speaking).
+      if (code === "conversation_already_has_active_response") {
+        clearInFlight();
+        pumpSpeakQueue();
+        return;
+      }
+
       clearInFlight();
       pumpSpeakQueue();
     }
@@ -629,7 +779,7 @@ wss.on("connection", (twilioWs) => {
   if (MB_MAX_CALL_MS > 0) {
     if (MB_MAX_WARN_BEFORE_MS > 0 && MB_MAX_CALL_MS > MB_MAX_WARN_BEFORE_MS) {
       maxWarnT = setTimeout(() => {
-        if (!callEnded) speakExact("עוֹד מְעַט נְסַיֵּם כְּדֵי לְשְׁמֹר עַל זְמַן הַשִּׂיחָה.", "max_call_warning");
+        if (!callEnded) speakExact(getStr("max_call_warning", "עוֹד מְעַט נְסַיֵּם כְּדֵי לְשְׁמֹר עַל זְמַן הַשִּׂיחָה."), "max_call_warning");
       }, MB_MAX_CALL_MS - MB_MAX_WARN_BEFORE_MS);
     }
     maxEndT = setTimeout(async () => {
@@ -668,7 +818,7 @@ wss.on("connection", (twilioWs) => {
       // flush buffered OpenAI->Twilio audio
       if (streamSid && outAudioBuffer.length) {
         for (const b64 of outAudioBuffer.splice(0, outAudioBuffer.length)) {
-          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
+          try { twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } })); } catch {}
         }
       }
       return;
@@ -691,12 +841,12 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
+      openAiSafeSend({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
 
     if (msg.event === "stop") {
-      const full = !!(lead.first_name && (lead.phone_number || callerPhoneLocal));
+      const full = !!(lead.first_name && lead.last_name && lead.study_track && (lead.phone_number || callerPhoneLocal));
       await finish(full ? "שיחה מלאה" : "שיחה חלקית", full ? "completed" : "partial", "twilio_stop", { speakClosing: false });
     }
   });
