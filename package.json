@@ -1,5 +1,5 @@
 {
-  "name": "nice-line-voice-ai",
+  "name": "niceline-voice-bot",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
@@ -9,6 +9,10 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "twilio": "^5.3.1",
     "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
