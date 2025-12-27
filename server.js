@@ -2,13 +2,12 @@
 // Malam – Voice AI (Inbound) – STRICT RECEPTION FLOW
 // Twilio Media Streams <-> OpenAI Realtime API
 //
-// Fixes:
-// - OpenAI content type must be "text" (NOT "output_text")
-// - Proper audio bridge OpenAI -> Twilio
-// - Buffer Twilio audio until OpenAI WS is open (prevents CONNECTING crash)
-// - Strong response-lock to avoid "conversation_already_has_active_response"
-// - Strict flow: consent -> name -> confirm caller phone -> manual phone -> confirm -> close
-// - No email. Always send caller_id + status to Make.
+// Key changes:
+// - Opening/Closing are NOT in MB_CONVERSATION_PROMPT anymore.
+//   They are controlled via ENV: MB_OPENING_TEXT / MB_CLOSING_TEXT
+// - On twilio_stop (call already ended) we DO NOT attempt to speak closing.
+// - Strict per-call reset (new WS, new state, clean queues)
+// - Always send caller_id + status to Make; no email.
 //
 // npm i express ws dotenv
 // node server.js
@@ -101,12 +100,21 @@ function renderTemplate(text, vars = {}) {
 /* ------------------------- config ------------------------- */
 const PORT = envNum("PORT", 10000);
 
+// OpenAI
 const OPENAI_API_KEY = envStr("OPENAI_API_KEY", "");
 const OPENAI_VOICE = envStr("OPENAI_VOICE", "cedar");
 
+// PROMPT JSON (system + questions + guardrail + retries)
 const MB_CONVERSATION_PROMPT_RAW = envStr("MB_CONVERSATION_PROMPT", "");
+
+// Opening/Closing separated (YOU control fully)
+const MB_OPENING_TEXT = envStr("MB_OPENING_TEXT", "");
+const MB_CLOSING_TEXT = envStr("MB_CLOSING_TEXT", "");
+
+// Webhook (Make)
 const MB_WEBHOOK_URL = envStr("MB_WEBHOOK_URL", "").trim();
 
+// Debug
 const MB_DEBUG = envBool("MB_DEBUG", true);
 
 // Noise / VAD
@@ -115,11 +123,11 @@ const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
 const MB_VAD_PREFIX_MS = envNum("MB_VAD_PREFIX_MS", 200);
 const MB_VAD_SUFFIX_MS = envNum("MB_VAD_SUFFIX_MS", 200);
 
-// Barge-in feel
+// Barge-in
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_NO_BARGE_TAIL_MS = envNum("MB_NO_BARGE_TAIL_MS", 900);
 
-// timers
+// Timers
 const MB_IDLE_WARNING_MS = envNum("MB_IDLE_WARNING_MS", 25000);
 const MB_IDLE_HANGUP_MS = envNum("MB_IDLE_HANGUP_MS", 55000);
 const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 3 * 60 * 1000);
@@ -129,18 +137,14 @@ const MB_HANGUP_GRACE_MS = envNum("MB_HANGUP_GRACE_MS", 4500);
 // response safety
 const MB_RESPONSE_FAILSAFE_MS = envNum("MB_RESPONSE_FAILSAFE_MS", 12000);
 
-function ilog(...a) {
-  console.log("[INFO]", ...a);
-}
-function elog(...a) {
-  console.error("[ERROR]", ...a);
-}
-function dlog(...a) {
-  if (MB_DEBUG) console.log("[DEBUG]", ...a);
-}
+function ilog(...a) { console.log("[INFO]", ...a); }
+function elog(...a) { console.error("[ERROR]", ...a); }
+function dlog(...a) { if (MB_DEBUG) console.log("[DEBUG]", ...a); }
 
 if (!OPENAI_API_KEY) elog("[FATAL] Missing OPENAI_API_KEY");
 if (!MB_CONVERSATION_PROMPT_RAW) elog("[FATAL] Missing MB_CONVERSATION_PROMPT");
+if (!MB_OPENING_TEXT) ilog("[WARN] Missing MB_OPENING_TEXT");
+if (!MB_CLOSING_TEXT) ilog("[WARN] Missing MB_CLOSING_TEXT");
 if (!MB_WEBHOOK_URL) ilog("[WARN] Missing MB_WEBHOOK_URL (Make) – will not push leads.");
 
 /* ------------------------- prompt JSON ------------------------- */
@@ -183,6 +187,7 @@ const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 app.get("/health", (_req, res) => res.json({ ok: true, time: nowIso() }));
 
 wss.on("connection", (twilioWs) => {
+  // ---- per call reset (everything inside connection) ----
   let streamSid = "";
   let callSid = "";
   let caller = "";
@@ -205,18 +210,15 @@ wss.on("connection", (twilioWs) => {
   let lastMediaTs = Date.now();
   let idleWarned = false;
 
-  // speaking / barge-in
   let botSpeaking = false;
   let noListenUntilTs = 0;
 
-  // buffers
   const inAudioBuffer = [];
   const MAX_IN_AUDIO_BUFFER = 300;
 
   const outAudioBuffer = [];
   const MAX_OUT_AUDIO_BUFFER = 600;
 
-  // strict response queue lock
   let responseInFlight = false;
   let responseTimer = null;
   const speakQueue = [];
@@ -270,17 +272,10 @@ wss.on("connection", (twilioWs) => {
     startInFlightFailsafe();
     dlog("SPEAK>", why, text);
 
-    // ✅ IMPORTANT: content type must be "text"
-    openAiWs.send(
-      JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "assistant",
-          content: [{ type: "text", text }],
-        },
-      })
-    );
+    openAiWs.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: { type: "message", role: "assistant", content: [{ type: "text", text }] }
+    }));
     openAiWs.send(JSON.stringify({ type: "response.create" }));
   }
 
@@ -294,7 +289,7 @@ wss.on("connection", (twilioWs) => {
 
   function askCurrent() {
     const qs = CONV.questions || {};
-    if (state === STATES.CONSENT) return speakExact(getStr("opening", ""), "opening_consent");
+    if (state === STATES.CONSENT) return speakExact(MB_OPENING_TEXT, "opening");
     if (state === STATES.ASK_NAME) return speakExact(qs.ask_name || "", "ask_name");
     if (state === STATES.CONFIRM_CALLER_PHONE) {
       return speakExact(renderTemplate(qs.confirm_caller_phone || "", { last4: last4(callerPhoneLocal) }), "confirm_caller_phone");
@@ -335,23 +330,28 @@ wss.on("connection", (twilioWs) => {
     if (!r.ok) elog("CRM> FAILED", r);
   }
 
-  async function finish(statusHe, statusCode, reason) {
+  async function finish(statusHe, statusCode, reason, opts = { speakClosing: true }) {
     if (callEnded) return;
     callEnded = true;
 
     await deliver(statusHe, statusCode, reason);
 
-    speakExact(getStr("closing", ""), "closing");
-
-    setTimeout(() => {
+    if (opts.speakClosing) {
+      speakExact(MB_CLOSING_TEXT, "closing");
+      setTimeout(() => {
+        try { openAiWs?.close(); } catch {}
+        try { twilioWs?.close(); } catch {}
+      }, Math.max(2500, Math.min(MB_HANGUP_GRACE_MS, 9000)));
+    } else {
+      // call already ended -> just close sockets silently
       try { openAiWs?.close(); } catch {}
       try { twilioWs?.close(); } catch {}
-    }, Math.max(2500, Math.min(MB_HANGUP_GRACE_MS, 9000)));
+    }
   }
 
   function guardrailAndClose() {
-    speakExact(getStr("guardrail", "אֲנַחְנוּ מַעֲרֶכֶת רִישּׁוּם בִּלְבַד. נָצִיג יַחֲזֹר אֲלֵיכֶם עִם כָּל הַהֶסְבֵּרִים. יוֹם טוֹב."), "guardrail");
-    finish("שיחה חלקית", "partial", "guardrail_question");
+    speakExact(getStr("guardrail", "אנחנו מערכת רישום בלבד. נציג יחזור אליכם עם כל ההסברים. יום טוב."), "guardrail");
+    finish("שיחה חלקית", "partial", "guardrail_question", { speakClosing: false });
   }
 
   /* ------------------------- OpenAI Realtime WS ------------------------- */
@@ -362,30 +362,29 @@ wss.on("connection", (twilioWs) => {
   openAiWs.on("open", () => {
     openAiReady = true;
 
-    openAiWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          model: "gpt-4o-realtime-preview-2024-12-17",
-          modalities: ["audio", "text"],
-          voice: OPENAI_VOICE,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          input_audio_transcription: { model: "whisper-1" },
-          turn_detection: {
-            type: "server_vad",
-            threshold: MB_VAD_THRESHOLD,
-            silence_duration_ms: MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS,
-            prefix_padding_ms: MB_VAD_PREFIX_MS,
-          },
-          max_response_output_tokens: 120,
-          instructions:
-            (getStr("system", "") || "") +
-            "\n\nחוקים: אתם גבר בשם מוטי. מדברים בלשון רבים בלבד. אין איסוף אימייל. אין לשנות ניסוחים. " +
-            "אם נשאלת שאלה על מחיר/תוכן/מועדים/התאמה/הלכה – לענות רק guardrail ואז לסיים.",
+    openAiWs.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        model: "gpt-4o-realtime-preview-2024-12-17",
+        modalities: ["audio", "text"],
+        voice: OPENAI_VOICE,
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        input_audio_transcription: { model: "whisper-1" },
+        // keep it deterministic
+        temperature: 0,
+        turn_detection: {
+          type: "server_vad",
+          threshold: MB_VAD_THRESHOLD,
+          silence_duration_ms: MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS,
+          prefix_padding_ms: MB_VAD_PREFIX_MS
         },
-      })
-    );
+        max_response_output_tokens: 140,
+        instructions: (getStr("system", "") || "") +
+          "\n\nחוקים קשיחים: אתם גבר בשם מוטי. עברית תקינה, לשון רבים בלבד. " +
+          "אין לאסוף אימייל. אין לשנות ניסוחים. כל שאלה על מחיר/תוכן/מועדים/התאמה/הלכה => guardrail ואז סיום."
+      }
+    }));
 
     // flush buffered Twilio->OpenAI audio
     while (inAudioBuffer.length) {
@@ -441,10 +440,10 @@ wss.on("connection", (twilioWs) => {
           return;
         }
         if (isNo(userText)) {
-          await finish("שיחה חלקית", "not_interested", "consent_no");
+          await finish("שיחה חלקית", "not_interested", "consent_no", { speakClosing: false });
           return;
         }
-        speakExact(getStr("consent_retry", "רַק לוֹדֵא: זֶה בְּסֵדֶר מִבַּחִינַתְכֶם?"), "consent_retry");
+        speakExact(getStr("consent_retry", "רק לוודא: זה בסדר מבחינתכם? אפשר לענות כן או לא."), "consent_retry");
         return;
       }
 
@@ -467,7 +466,7 @@ wss.on("connection", (twilioWs) => {
       if (state === STATES.CONFIRM_CALLER_PHONE) {
         if (isYes(userText)) {
           lead.phone_number = callerPhoneLocal;
-          await finish("שיחה מלאה", "completed", "caller_phone_confirmed");
+          await finish("שיחה מלאה", "completed", "caller_phone_confirmed", { speakClosing: true });
           return;
         }
         if (isNo(userText)) {
@@ -476,14 +475,14 @@ wss.on("connection", (twilioWs) => {
           askCurrent();
           return;
         }
-        speakExact(getStr("questions.confirm_caller_phone_retry", "אֶפְשָׁר לַעֲנוֹת רַק כֵּן אוֹ לֹא."), "confirm_retry");
+        speakExact(getStr("questions.confirm_caller_phone_retry", "אפשר לענות רק כן או לא. זה המספר הנכון לחזרה?"), "confirm_retry");
         return;
       }
 
       if (state === STATES.ASK_PHONE_MANUAL) {
         const p = normalizeIsraeliPhone(userText, "");
         if (!p) {
-          speakExact(getStr("questions.phone_retry", "סְלִיחָה, אֲנָא אִמְרוּ מִסְפָּר תָּקִין בְּסִפְרוֹת."), "phone_retry");
+          speakExact(getStr("questions.phone_retry", "סליחה, צריך מספר תקין בספרות בלבד. ננסה שוב."), "phone_retry");
           return;
         }
         lead.phone_number = p;
@@ -495,7 +494,7 @@ wss.on("connection", (twilioWs) => {
 
       if (state === STATES.CONFIRM_PHONE_MANUAL) {
         if (isYes(userText)) {
-          await finish("שיחה מלאה", "completed", "manual_phone_confirmed");
+          await finish("שיחה מלאה", "completed", "manual_phone_confirmed", { speakClosing: true });
           return;
         }
         if (isNo(userText)) {
@@ -504,7 +503,7 @@ wss.on("connection", (twilioWs) => {
           askCurrent();
           return;
         }
-        speakExact(getStr("questions.confirm_phone_manual_retry", "אֶפְשָׁר לַעֲנוֹת רַק כֵּן אוֹ לֹא."), "confirm_manual_retry");
+        speakExact(getStr("questions.confirm_phone_manual_retry", "אפשר לענות רק כן או לא. המספר נכון?"), "confirm_manual_retry");
         return;
       }
     }
@@ -512,30 +511,20 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "error") {
       const code = msg?.error?.code;
       elog("OpenAI error", msg);
-
-      // IMPORTANT: don't clear lock for "already active" (wait for done)
-      if (code === "conversation_already_has_active_response") {
-        // just ignore; lock stays
-        return;
-      }
-
-      // for any other error, release lock and continue queue
+      if (code === "conversation_already_has_active_response") return; // keep lock
       clearInFlight();
       pumpSpeakQueue();
     }
   });
 
   openAiWs.on("close", async () => {
-    if (!callEnded) {
-      elog("OpenAI WS closed");
-      await finish("שיחה חלקית", "partial", "openai_closed");
-    }
+    if (!callEnded) await finish("שיחה חלקית", "partial", "openai_closed", { speakClosing: false });
   });
 
   openAiWs.on("error", async (e) => {
     if (!callEnded) {
       elog("OpenAI WS error", e?.message || e);
-      await finish("שיחה חלקית", "partial", "openai_ws_error");
+      await finish("שיחה חלקית", "partial", "openai_ws_error", { speakClosing: false });
     }
   });
 
@@ -546,10 +535,10 @@ wss.on("connection", (twilioWs) => {
 
     if (!idleWarned && since >= MB_IDLE_WARNING_MS) {
       idleWarned = true;
-      speakExact(getStr("idle_warning", "רַק לוֹדֵא שֶׁאַתֶּם עִמָּנוּ."), "idle_warning");
+      speakExact(getStr("idle_warning", "רק לוודא שאתם איתנו."), "idle_warning");
     }
     if (since >= MB_IDLE_HANGUP_MS) {
-      await finish("שיחה חלקית", "partial", "idle_timeout");
+      await finish("שיחה חלקית", "partial", "idle_timeout", { speakClosing: false });
       clearInterval(idleInterval);
     }
   }, 1000);
@@ -563,7 +552,7 @@ wss.on("connection", (twilioWs) => {
       }, MB_MAX_CALL_MS - MB_MAX_WARN_BEFORE_MS);
     }
     maxEndT = setTimeout(async () => {
-      if (!callEnded) await finish("שיחה חלקית", "partial", "max_call_duration");
+      if (!callEnded) await finish("שיחה חלקית", "partial", "max_call_duration", { speakClosing: false });
     }, MB_MAX_CALL_MS);
   }
 
@@ -620,7 +609,8 @@ wss.on("connection", (twilioWs) => {
 
     if (msg.event === "stop") {
       const full = !!(lead.first_name && (lead.phone_number || callerPhoneLocal));
-      finish(full ? "שיחה מלאה" : "שיחה חלקית", full ? "completed" : "partial", "twilio_stop");
+      // call already ended -> no closing speech attempt
+      finish(full ? "שיחה מלאה" : "שיחה חלקית", full ? "completed" : "partial", "twilio_stop", { speakClosing: false });
     }
   });
 
