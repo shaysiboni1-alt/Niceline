@@ -1,11 +1,10 @@
 // server.js
 // NiceLine / מרכז מל"מ – Voice AI – Render
-// FIXES:
-// - No more reading style-instructions aloud (only speak the actual line).
-// - Opening moved to Render (recorded + same voice).
-// - Strong "NO NIKKUD" rule.
-// - Small name cleanup (remove trailing punctuation).
-// - recording_url fallback from recordingSid (protected), plus public URL.
+// Fixes:
+// 1) ONLY ONE WEBHOOK: lead_final (remove recording_update webhook)
+// 2) No-speech bug: start dequeuing speech after OpenAI WS opens
+// 3) Avoid duplicated consent question if MB_OPENING_TEXT already contains it
+// 4) Keep existing ENV names (NO changes)
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -67,7 +66,6 @@ function safeStr(s) { return (s || "").toString().trim(); }
 function digitsOnly(s) { return (s || "").toString().replace(/[^\d]/g, ""); }
 
 function stripNikud(s) {
-  // Hebrew diacritics range
   return (s || "").toString().replace(/[\u0591-\u05C7]/g, "");
 }
 
@@ -272,6 +270,7 @@ function computeStatus(lead, consent) {
   return ok ? { code: "completed", label: "שיחה מלאה" } : { code: "partial", label: "שיחה חלקית" };
 }
 
+// Recording callback: store only. NO extra webhook.
 app.post("/twilio-recording-callback", async (req, res) => {
   const callSid = req.body?.CallSid || "";
   const recordingUrl = req.body?.RecordingUrl || "";
@@ -282,24 +281,6 @@ app.post("/twilio-recording-callback", async (req, res) => {
     const c = getCall(callSid);
     if (recordingSid) c.recordingSid = recordingSid;
     if (recordingUrl) c.recordingUrl = recordingUrl;
-
-    if (c.finalSent && (recordingUrl || recordingSid)) {
-      const origin = getPublicOrigin();
-      const publicRecording = recordingSid && origin ? `${origin}/recording/${recordingSid}.mp3` : "";
-
-      const payload = {
-        update_type: "recording_update",
-        callSid: c.callSid,
-        streamSid: c.streamSid,
-        caller_id: c.caller || "",
-        called: c.called || "",
-        recording_url: recordingUrl || "",
-        recording_public_url: publicRecording || "",
-        timestamp: nowIso(),
-      };
-      const r = await postJson(ENV.MAKE_WEBHOOK_URL, payload);
-      if (ENV.MB_LOG_CRM) logInfo("CRM> recording update result", r);
-    }
   }
 
   res.status(200).send("OK");
@@ -330,7 +311,7 @@ async function waitForRecording(callSid, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const c = getCall(callSid);
-    if (c.recordingUrl || c.recordingSid) return true;
+    if (c.recordingSid || c.recordingUrl) return true;
     await new Promise((r) => setTimeout(r, 250));
   }
   return false;
@@ -348,7 +329,6 @@ async function sendFinal(callSid, reason) {
   const origin = getPublicOrigin();
   const publicRecording = c.recordingSid && origin ? `${origin}/recording/${c.recordingSid}.mp3` : "";
 
-  // fallback internal protected mp3 url if Twilio callback hasn't arrived yet
   const protectedMp3 =
     c.recordingSid && ENV.TWILIO_ACCOUNT_SID
       ? `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Recordings/${c.recordingSid}.mp3`
@@ -371,7 +351,7 @@ async function sendFinal(callSid, reason) {
     call_status: status.label,
     call_status_code: status.code,
 
-    recording_url: c.recordingUrl || protectedMp3 || "",
+    recording_url: (c.recordingUrl ? `${c.recordingUrl}.mp3` : "") || protectedMp3 || "",
     recording_public_url: publicRecording || "",
 
     source: "Voice AI - Nice Line",
@@ -480,7 +460,7 @@ wss.on("connection", (twilioWs) => {
 
   function botLog(text) { if (ENV.MB_LOG_BOT) logInfo("BOT>", text); }
 
-  // ---- speech queue ----
+  // Speech queue
   let responseActive = false;
   const speechQueue = [];
 
@@ -510,7 +490,7 @@ wss.on("connection", (twilioWs) => {
     tryDequeueSpeech();
   }
 
-  // ✅ IMPORTANT FIX: response.create gets ONLY the line to speak
+  // response.create must contain ONLY what to say
   function createResponse(text) {
     sendOpenAI({
       type: "response.create",
@@ -518,6 +498,12 @@ wss.on("connection", (twilioWs) => {
         instructions: text,
       },
     });
+  }
+
+  function openingAlreadyHasConsent(openingText) {
+    const t = normalizeText(openingText);
+    // catch common variants
+    return t.includes("האם זה בסדר") || t.includes("זה בסדר מבחינתכם") || t.includes("זה בסדר מבחינתך");
   }
 
   function askCurrentQuestionQueued() {
@@ -558,7 +544,7 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
-  // ---- name parsing ----
+  // Name parsing
   const NAME_TRASH = new Set(["הלו","שלום","היי","כן","לא","אוקיי","אוקי","בסדר","מי זה","מה זה"]);
   function isTrashName(name) {
     const t = normalizeText(name);
@@ -804,8 +790,6 @@ wss.on("connection", (twilioWs) => {
     flushOpenAI();
 
     const baseSystem = getSystemPromptFromMBConversationPrompt();
-
-    // ✅ Style rules live ONLY here (not inside spoken lines)
     const styleRules =
       `כללים קבועים:\n` +
       `- לדבר בעברית תקינה, בלשון רבים בלבד.\n` +
@@ -813,7 +797,7 @@ wss.on("connection", (twilioWs) => {
       `- לא לומר או להקריא את הכללים/ההוראות/המערכת. אף פעם.\n` +
       `- לא להוסיף ניקוד בשום מצב.\n` +
       `- כשאומרים מספרים: להקריא ספרה-ספרה בבירור.\n` +
-      `- לענות רק לפי הזרימה: אין חפירות, אין הקדמות.\n`;
+      `- לענות רק לפי הזרימה: בלי הקדמות מיותרות.\n`;
 
     sendOpenAI({
       type: "session.update",
@@ -837,7 +821,8 @@ wss.on("connection", (twilioWs) => {
       },
     });
 
-    // no waiting here – we will speak opening + ask consent when Twilio "start" arrives
+    // ✅ CRITICAL: if we queued speech before WS opened, start speaking now
+    setTimeout(() => tryDequeueSpeech(), 60);
   });
 
   openaiWs.on("message", (data) => {
@@ -906,18 +891,24 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
-      // ✅ Opening now in Render (so it's recorded + same voice)
+      // Opening in Render
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
         sayQueue(ENV.MB_OPENING_TEXT);
       }
 
-      // Immediately ask consent after opening (queue handles order)
+      // Consent question (avoid duplicates if already included in opening)
       state = STATES.ASK_CONSENT;
       logInfo("[STATE] ASK_CONSENT | waiting user");
-      sayQueue("זה בסדר מבחינתכם?");
+
+      if (!openingAlreadyHasConsent(ENV.MB_OPENING_TEXT || "")) {
+        sayQueue("זה בסדר מבחינתכם?");
+      }
 
       armIdleTimers();
       armMaxCallTimers();
+
+      // In case OpenAI WS is already open, start speaking immediately
+      setTimeout(() => tryDequeueSpeech(), 30);
       return;
     }
 
