@@ -4,7 +4,8 @@
 // 1) ONLY ONE WEBHOOK: lead_final (remove recording_update webhook)
 // 2) No-speech bug: start dequeuing speech after OpenAI WS opens
 // 3) Avoid duplicated consent question if MB_OPENING_TEXT already contains it
-// 4) Keep existing ENV names (NO changes)
+// 4) KEEP EXISTING ENV NAMES (NO changes)
+// 5) NEW: "Gate" – ignore user transcripts until opening+consent question played (prevents weird starts)
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -382,6 +383,11 @@ wss.on("connection", (twilioWs) => {
   let callerPhoneLocal = "";
   let openingPlayedByTwilio = false;
 
+  // ✅ NEW: Gate
+  let gateActive = true;
+  let gateStartMs = 0;
+  let consentQuestionWasSpoken = false;
+
   const STATES = {
     ASK_CONSENT: "ASK_CONSENT",
     ASK_NAME: "ASK_NAME",
@@ -460,7 +466,6 @@ wss.on("connection", (twilioWs) => {
 
   function botLog(text) { if (ENV.MB_LOG_BOT) logInfo("BOT>", text); }
 
-  // Speech queue
   let responseActive = false;
   const speechQueue = [];
 
@@ -479,6 +484,13 @@ wss.on("connection", (twilioWs) => {
 
     const nextText = speechQueue.shift();
     responseActive = true;
+
+    // ✅ Mark that consent question was actually spoken (for Gate)
+    const nt = normalizeText(nextText);
+    if (state === STATES.ASK_CONSENT && (nt.includes("זה בסדר") || nt.includes("האם זה בסדר"))) {
+      consentQuestionWasSpoken = true;
+    }
+
     createResponse(nextText);
   }
 
@@ -490,7 +502,6 @@ wss.on("connection", (twilioWs) => {
     tryDequeueSpeech();
   }
 
-  // response.create must contain ONLY what to say
   function createResponse(text) {
     sendOpenAI({
       type: "response.create",
@@ -502,7 +513,6 @@ wss.on("connection", (twilioWs) => {
 
   function openingAlreadyHasConsent(openingText) {
     const t = normalizeText(openingText);
-    // catch common variants
     return t.includes("האם זה בסדר") || t.includes("זה בסדר מבחינתכם") || t.includes("זה בסדר מבחינתך");
   }
 
@@ -544,7 +554,6 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
-  // Name parsing
   const NAME_TRASH = new Set(["הלו","שלום","היי","כן","לא","אוקיי","אוקי","בסדר","מי זה","מה זה"]);
   function isTrashName(name) {
     const t = normalizeText(name);
@@ -608,8 +617,26 @@ wss.on("connection", (twilioWs) => {
     }, endAfterMs);
   }
 
+  function gateAllowsInput() {
+    if (!gateActive) return true;
+    // מינימום זמן כדי לאפשר לבוט להתחיל להשמיע
+    const minMs = 1800;
+    if (Date.now() - gateStartMs < minMs) return false;
+    // משחררים אחרי ששאלת ההסכמה הושמעה בפועל (או פתיח כולל הסכמה)
+    return consentQuestionWasSpoken || openingAlreadyHasConsent(ENV.MB_OPENING_TEXT || "");
+  }
+
   function advanceAfter(userText) {
     const c = getCall(callSid);
+
+    if (!gateAllowsInput()) {
+      dbg("GATE: ignoring early user input:", userText);
+      return;
+    } else {
+      // ברגע שהגענו לפה פעם ראשונה – משחררים Gate
+      gateActive = false;
+    }
+
     if (ENV.MB_LOG_TRANSCRIPTS) logInfo("USER>", userText);
 
     armIdleTimers();
@@ -821,7 +848,6 @@ wss.on("connection", (twilioWs) => {
       },
     });
 
-    // ✅ CRITICAL: if we queued speech before WS opened, start speaking now
     setTimeout(() => tryDequeueSpeech(), 60);
   });
 
@@ -879,6 +905,11 @@ wss.on("connection", (twilioWs) => {
 
       callerPhoneLocal = (caller || "").startsWith("+972") ? "0" + caller.slice(4) : digitsOnly(caller);
 
+      // ✅ Gate init
+      gateActive = true;
+      gateStartMs = Date.now();
+      consentQuestionWasSpoken = false;
+
       logInfo("CALL start", { streamSid, callSid, caller, called, callerPhoneLocal });
 
       const c = getCall(callSid);
@@ -891,23 +922,23 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
-      // Opening in Render
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
         sayQueue(ENV.MB_OPENING_TEXT);
       }
 
-      // Consent question (avoid duplicates if already included in opening)
       state = STATES.ASK_CONSENT;
       logInfo("[STATE] ASK_CONSENT | waiting user");
 
       if (!openingAlreadyHasConsent(ENV.MB_OPENING_TEXT || "")) {
         sayQueue("זה בסדר מבחינתכם?");
+      } else {
+        // אם הפתיח כבר כולל "האם זה בסדר" – נחשב כאילו שאלנו
+        consentQuestionWasSpoken = true;
       }
 
       armIdleTimers();
       armMaxCallTimers();
 
-      // In case OpenAI WS is already open, start speaking immediately
       setTimeout(() => tryDequeueSpeech(), 30);
       return;
     }
