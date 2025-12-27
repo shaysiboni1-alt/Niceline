@@ -1,13 +1,15 @@
 // server.js
-// NiceLine – Malam Voice AI (Inbound) – STRICT FLOW + ALL-CALL RECORDING + MAKE RECORDING UPDATE
+// NiceLine – Malam Voice AI (Inbound) – STRICT FLOW + ALL-CALL RECORDING + MAKE RECORDING UPDATE (FIXED)
 // Twilio Media Streams <-> OpenAI Realtime API
 //
-// Goals (fixes):
-// - Opening / Closing are ENV controlled (MB_OPENING_TEXT / MB_CLOSING_TEXT) and read VERBATIM (no paraphrase).
-// - Strict per-call reset (no state carry-over).
-// - Prevent "conversation_already_has_active_response" via hard queue + cancel + failsafe.
-// - Start Twilio call recording "ALL CALL" via REST on call start.
-// - Receive RecordingUrl via /twilio-recording-callback and send a SECOND update to Make (same CallSid).
+// Fixes included:
+// - response.create modalities MUST be ["audio","text"] (not ["audio"]) to avoid OpenAI errors/no-audio.
+// - temperature enforced >= 0.6.
+// - Strict per-call reset (no carry-over).
+// - Send to Make ONLY after call ends (twilio stop / timeouts / user exit).
+// - Start Twilio "ALL CALL" recording via REST on call start.
+// - Receive RecordingUrl via /twilio-recording-callback and update Make by callSid.
+// - Optional wait at end to include recording_url in final lead if callback arrives quickly.
 //
 // npm i express ws dotenv
 // node server.js
@@ -98,12 +100,15 @@ const PORT = envNum("PORT", 10000);
 const OPENAI_API_KEY = envStr("OPENAI_API_KEY", "");
 const OPENAI_VOICE = envStr("OPENAI_VOICE", "cedar");
 
+// Prompts/texts
 const MB_CONVERSATION_PROMPT_RAW = envStr("MB_CONVERSATION_PROMPT", "");
 const MB_OPENING_TEXT = envStr("MB_OPENING_TEXT", "");
 const MB_CLOSING_TEXT = envStr("MB_CLOSING_TEXT", "");
 
+// Make webhook
 const MB_WEBHOOK_URL = envStr("MB_WEBHOOK_URL", "").trim();
 
+// Debug
 const MB_DEBUG = envBool("MB_DEBUG", true);
 
 // Recording (All call)
@@ -111,6 +116,9 @@ const MB_ENABLE_RECORDING = envBool("MB_ENABLE_RECORDING", false);
 const MB_RECORDING_STATUS_CALLBACK_URL = envStr("MB_RECORDING_STATUS_CALLBACK_URL", "").trim();
 const TWILIO_ACCOUNT_SID = envStr("TWILIO_ACCOUNT_SID", "");
 const TWILIO_AUTH_TOKEN = envStr("TWILIO_AUTH_TOKEN", "");
+
+// Optional: wait a bit on call end to include recording_url in final payload (ms)
+const MB_RECORDING_WAIT_MS = envNum("MB_RECORDING_WAIT_MS", 8000);
 
 // Noise / VAD
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
@@ -131,7 +139,7 @@ const MB_MAX_WARN_BEFORE_MS = envNum("MB_MAX_WARN_BEFORE_MS", 30000);
 // Response safety
 const MB_RESPONSE_FAILSAFE_MS = envNum("MB_RESPONSE_FAILSAFE_MS", 12000);
 
-// Temperature: model enforces >= 0.6 (you saw the error when it was 0)
+// Temperature: enforce >= 0.6
 const OPENAI_TEMPERATURE = Math.max(0.6, envNum("MB_TEMPERATURE", 0.6));
 
 function ilog(...a) { console.log("[INFO]", ...a); }
@@ -174,9 +182,9 @@ function parseTrack(raw) {
   if (/דיינות/.test(s) || /דיינ/.test(s)) return "דיינות";
   if (/רבנות/.test(s) || /רבנ/.test(s)) return "רבנות";
 
-  // English-ish (NO broken char-class ranges!)
+  // English-ish (SAFE regex – no broken ranges)
   if (/toen|toen\s*rabani|toen\s*rabboni|tollen|tolen|rabani|rabboni/.test(s)) return "טוען רבני";
-  if (/dayanut|dayan(?:u)?t|dayanut|dayanut/.test(s)) return "דיינות";
+  if (/dayanut|dayan(?:u)?t|dayanoot|dayanut/.test(s)) return "דיינות";
   if (/rabbanut|rabba(?:\s|-)?nut|rabb(?:\s|-)?anut|rab(?:\s|-)?anut|rabban(?:\s|-)?ut/.test(s)) return "רבנות";
 
   return "";
@@ -251,8 +259,6 @@ const lastPayloadByCallSid = new Map();    // callSid -> last payload sent to Ma
 function setRecordingUrl(callSid, url) {
   if (!callSid || !url) return;
   recordingByCallSid.set(callSid, url);
-
-  // cleanup after 2 hours
   setTimeout(() => recordingByCallSid.delete(callSid), 2 * 60 * 60 * 1000).unref?.();
 }
 function getRecordingUrl(callSid) {
@@ -284,7 +290,7 @@ app.post("/twilio-recording-callback", async (req, res) => {
   if (callSid && recordingUrl) {
     setRecordingUrl(callSid, recordingUrl);
 
-    // Send a SECOND update to Make so the row can be updated with recording_url
+    // Send update so Make can update the same row (use callSid as key)
     const prev = getLastPayload(callSid);
     const updatePayload = {
       update_type: "recording_update",
@@ -292,13 +298,13 @@ app.post("/twilio-recording-callback", async (req, res) => {
       recording_url: recordingUrl,
       timestamp: nowIso(),
 
-      // keep these if we have them, to help Make map/update
       caller_id: prev?.caller_id || "",
       called: prev?.called || "",
       streamSid: prev?.streamSid || "",
       call_status: prev?.call_status || "",
       call_status_code: prev?.call_status_code || "",
       source: prev?.source || "Voice AI - Nice Line",
+
       first_name: prev?.first_name || "",
       last_name: prev?.last_name || "",
       phone_number: prev?.phone_number || "",
@@ -324,8 +330,8 @@ wss.on("connection", (twilioWs) => {
   // --- Per-call variables (STRICT RESET) ---
   let streamSid = "";
   let callSid = "";
-  let caller = "";
-  let called = "";
+  let caller = ""; // this is the identified number (customer)
+  let called = ""; // this is the bot number
   let callerPhoneLocal = "";
 
   const STATES = {
@@ -399,7 +405,6 @@ wss.on("connection", (twilioWs) => {
   // IMPORTANT: We force VERBATIM reading (no paraphrase).
   function buildVerbatimInstruction(text) {
     const clean = String(text || "").trim();
-    // Keep it very explicit
     return `קרא/י עכשיו בדיוק מילה במילה את הטקסט הבא, בלי לשנות, בלי להוסיף, ובלי להחסיר אף תו:\n"""${clean}"""`;
   }
 
@@ -418,13 +423,14 @@ wss.on("connection", (twilioWs) => {
     startInFlightFailsafe();
     dlog("SPEAK>", why, line);
 
-    // If somehow the model still thinks there's a response, cancel it first
+    // cancel any previous output safely (if none active, OpenAI may return an error -> harmless)
     openAiSafeSend({ type: "response.cancel" });
 
+    // ✅ FIX: modalities must be ["audio","text"] (not ["audio"])
     openAiSafeSend({
       type: "response.create",
       response: {
-        modalities: ["audio"],
+        modalities: ["audio", "text"],
         instructions: buildVerbatimInstruction(line),
         max_output_tokens: 180,
       },
@@ -457,11 +463,23 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
+  async function waitForRecordingUrl(callSidToWait, waitMs) {
+    if (!callSidToWait || waitMs <= 0) return "";
+    const start = Date.now();
+    while (Date.now() - start < waitMs) {
+      const url = getRecordingUrl(callSidToWait);
+      if (url) return url;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return getRecordingUrl(callSidToWait) || "";
+  }
+
   async function deliver(statusHe, statusCode, reason) {
     if (leadSent) return;
     leadSent = true;
 
-    const recording_url = getRecordingUrl(callSid) || "";
+    // Try to include recording_url already at final lead (best effort)
+    const recording_url = await waitForRecordingUrl(callSid, MB_RECORDING_WAIT_MS);
 
     const payload = {
       update_type: "lead",
@@ -472,7 +490,7 @@ wss.on("connection", (twilioWs) => {
       source: lead.source || "Voice AI - Nice Line",
       timestamp: lead.timestamp || nowIso(),
 
-      // HARD RULE: always send caller_id (identified number)
+      // HARD RULE: always send caller_id (identified number of customer)
       caller_id: lead.caller_id || caller || "",
       called: lead.called || called || "",
       callSid: callSid || "",
@@ -504,6 +522,7 @@ wss.on("connection", (twilioWs) => {
 
     await deliver(statusHe, statusCode, reason);
 
+    // Close sockets after optional closing
     if (opts.speakClosing && MB_CLOSING_TEXT) {
       speakExact(MB_CLOSING_TEXT, "closing");
       setTimeout(() => {
@@ -517,8 +536,7 @@ wss.on("connection", (twilioWs) => {
   }
 
   function guardrailAnswer() {
-    // short + on-script, no free talk
-    return getStr("guardrail", "אנחנו מערכת רישום בלבד. נציג לימודים יחזור אליכם עם כל ההסברים. אפשר להמשיך להשאיר פרטים?");
+    return getStr("guardrail", "אנחנו מערכת רישום בלבד. יועץ לימודים יחזור אליכם עם כל ההסברים. אפשר להמשיך להשאיר פרטים?");
   }
 
   /* ------------------------- OpenAI Realtime WS ------------------------- */
@@ -529,11 +547,11 @@ wss.on("connection", (twilioWs) => {
   openAiWs.on("open", () => {
     openAiReady = true;
 
-    // Session is per call; we do NOT rely on model free generation, only verbatim TTS responses.
     openAiSafeSend({
       type: "session.update",
       session: {
         model: "gpt-4o-realtime-preview-2024-12-17",
+        // ✅ FIX: session modalities must include BOTH audio+text to support audio output reliably
         modalities: ["audio", "text"],
         voice: OPENAI_VOICE,
         input_audio_format: "g711_ulaw",
@@ -549,10 +567,8 @@ wss.on("connection", (twilioWs) => {
           prefix_padding_ms: MB_VAD_PREFIX_MS,
         },
 
-        // keep answers short and stable
         max_response_output_tokens: 120,
 
-        // Hard rules: Hebrew, plural, no email, stick to flow.
         instructions:
           (getStr("system", "") || "") +
           "\n\nכללים קשיחים (חובה): עברית תקינה בלבד, לשון רבים בלבד. אין לאסוף אימייל. אין לשנות ניסוחים של שאלות/פתיח/סגיר. לא לענות תשובות חופשיות – רק הקראה של הטקסט שניתן לך.",
@@ -617,9 +633,7 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (looksLikeMetaQuestion(userText)) {
-        // short guardrail and continue the flow
         speakExact(guardrailAnswer(), "guardrail_meta");
-        // do NOT change state
         return;
       }
 
@@ -653,7 +667,6 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (state === STATES.ASK_FIRST) {
-        // prevent phone mistaken as first name
         const maybePhone = normalizeIsraeliPhone(userText, "");
         if (maybePhone) {
           speakExact(getStr("first_name_retry", "רק השם הפרטי בבקשה (לא מספר). איך קוראים לכם?"), "first_name_retry");
@@ -736,7 +749,7 @@ wss.on("connection", (twilioWs) => {
       const code = msg?.error?.code;
       elog("OpenAI error", msg);
 
-      // If we hit "active_response", we just release the lock and continue the queue (and we also cancel before speaking).
+      // release lock and continue queue
       if (code === "conversation_already_has_active_response") {
         clearInFlight();
         pumpSpeakQueue();
@@ -800,6 +813,7 @@ wss.on("connection", (twilioWs) => {
       caller = p.caller || "";
       called = p.called || "";
 
+      // IMPORTANT: caller_id = customer, called = bot number
       lead.caller_id = caller || "";
       lead.called = called || "";
       lead.timestamp = nowIso();
