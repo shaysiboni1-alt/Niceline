@@ -2,9 +2,10 @@
 // Nice Line – Voice AI (Inbound)
 // Twilio Media Streams <-> OpenAI Realtime API
 //
-// KEY IDEA:
-// - Single ENV for ALL conversation scripting: MB_CONVERSATION_PROMPT (JSON)
-// - Code is only an engine: state machine + validation + logs + CRM
+// ONE SCRIPT CONTROL ENV:
+// - MB_CONVERSATION_PROMPT (JSON) controls system/opening/closing/questions.
+// Engine is strict: track -> first -> last -> phone(confirm caller id).
+// No email step.
 //
 // npm i express ws dotenv
 // node server.js
@@ -35,22 +36,22 @@ const PORT = envNum("PORT", 10000);
 
 // OpenAI
 const OPENAI_API_KEY = envStr("OPENAI_API_KEY", "");
-const OPENAI_VOICE = envStr("OPENAI_VOICE", "alloy"); // alloy / ash / ballad / coral / echo / sage / shimmer / verse / marin / cedar
+const OPENAI_VOICE = envStr("OPENAI_VOICE", "cedar"); // supported: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 
-// Single conversation env
+// Single conversation env (JSON)
 const MB_CONVERSATION_PROMPT_RAW = envStr("MB_CONVERSATION_PROMPT", "");
 
 // Logs
 const MB_DEBUG = envBool("MB_DEBUG", true);
 const MB_REDACT_LOGS = envBool("MB_REDACT_LOGS", false);
 
-// VAD + background noise (kept as stable defaults; not script-related)
+// VAD + background noise tuning (stable)
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
 const MB_VAD_PREFIX_MS = envNum("MB_VAD_PREFIX_MS", 200);
 const MB_VAD_SUFFIX_MS = envNum("MB_VAD_SUFFIX_MS", 200);
 
-// Barge-in (kept simple and stable)
+// Barge-in
 const MB_ALLOW_BARGE_IN = envBool("MB_ALLOW_BARGE_IN", false);
 const MB_NO_BARGE_TAIL_MS = envNum("MB_NO_BARGE_TAIL_MS", 1600);
 
@@ -61,23 +62,15 @@ const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 4 * 60 * 1000);
 const MB_MAX_WARN_BEFORE_MS = envNum("MB_MAX_WARN_BEFORE_MS", 30000);
 const MB_HANGUP_GRACE_MS = envNum("MB_HANGUP_GRACE_MS", 4500);
 
-// CRM (Frontask preferred)
-const MB_FRONTASK_WEBTOLEAD_BASE = envStr("MB_FRONTASK_WEBTOLEAD_BASE", "").trim();
-const MB_FRONTASK_SYSTEM_ID = envStr("MB_FRONTASK_SYSTEM_ID", "").trim();
-const MB_FRONTASK_PROCESS_STEP_ID = envStr("MB_FRONTASK_PROCESS_STEP_ID", "").trim();
-const MB_FRONTASK_MAILINGLIST = envStr("MB_FRONTASK_MAILINGLIST", "0").trim();
-const MB_FRONTASK_UPDATE_EXISTING = envStr("MB_FRONTASK_UPDATE_EXISTING", "1").trim();
-
-// Optional fallback webhook
+// CRM -> Make webhook ONLY
 const MB_WEBHOOK_URL = envStr("MB_WEBHOOK_URL", "").trim();
 
 // safety
 if (!OPENAI_API_KEY) console.error("[FATAL] Missing OPENAI_API_KEY");
 if (!MB_CONVERSATION_PROMPT_RAW) console.error("[FATAL] Missing MB_CONVERSATION_PROMPT");
-if (!MB_FRONTASK_WEBTOLEAD_BASE && !MB_WEBHOOK_URL) {
-  console.error("[WARN] No CRM target set. Configure Frontask (recommended) or MB_WEBHOOK_URL.");
-}
+if (!MB_WEBHOOK_URL) console.error("[WARN] Missing MB_WEBHOOK_URL (Make webhook) – CRM send will fail.");
 
+/* ------------------------- logging ------------------------- */
 function dlog(...a) {
   if (MB_DEBUG) console.log("[DEBUG]", ...a);
 }
@@ -95,28 +88,39 @@ function nowIso() {
 function digitsOnly(v) {
   return String(v || "").replace(/\D/g, "");
 }
+
 function normalizeIsraeliPhone(raw, fallbackCaller) {
   let d = digitsOnly(raw || "");
   if (!d && fallbackCaller) d = digitsOnly(fallbackCaller);
   if (!d) return null;
-  if (d.startsWith("972") && (d.length === 11 || d.length === 12)) d = "0" + d.slice(3);
+
+  // if E.164 like +9725...
+  if (d.startsWith("972")) {
+    d = "0" + d.slice(3);
+  }
+
   if (!/^\d{9,10}$/.test(d)) return null;
   return d;
 }
-function isValidEmailLike(s) {
-  const t = String(s || "").trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(t);
-}
+
 function normalizeStudyTrack(raw) {
   const t = String(raw || "").trim().toLowerCase();
   if (!t) return null;
 
-  // allow common variations / STT confusions
+  // common variations / STT confusions
   if (t.includes("טוען")) return "טוען רבני";
   if (t.includes("דיינ") || t.includes("דיין") || t.includes("דיינות")) return "דיינות";
   if (t.includes("רבנ") || t.includes("רבנות") || t === "רב") return "רבנות";
-
   return null;
+}
+
+function isYes(text) {
+  const t = String(text || "").trim().toLowerCase();
+  return ["כן", "בטח", "בוודאי", "נכון", "כן כן", "יאפ", "כן.", "כן!"].some((w) => t === w || t.includes(w));
+}
+function isNo(text) {
+  const t = String(text || "").trim().toLowerCase();
+  return ["לא", "ממש לא", "לא תודה", "שלילי", "לא.", "לא!"].some((w) => t === w || t.includes(w));
 }
 
 function redactPhone(p) {
@@ -124,15 +128,9 @@ function redactPhone(p) {
   if (s.length < 4) return "***";
   return s.slice(0, 2) + "****" + s.slice(-2);
 }
-function redactEmail(e) {
-  const s = String(e || "");
-  const at = s.indexOf("@");
-  if (at <= 1) return "***@***";
-  return s[0] + "***" + s.slice(at);
-}
 function safePayload(p) {
   if (!MB_REDACT_LOGS) return p;
-  return { ...p, phone_number: redactPhone(p.phone_number), email: redactEmail(p.email) };
+  return { ...p, phone_number: redactPhone(p.phone_number) };
 }
 
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 4500) {
@@ -149,47 +147,39 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 4500) {
 
 /* ------------------------- Conversation prompt (single ENV) ------------------------- */
 /**
- * MB_CONVERSATION_PROMPT MUST be JSON with keys:
+ * MB_CONVERSATION_PROMPT JSON keys expected:
  * {
- *   "system": "...",
- *   "opening": "...",
- *   "closing": "...",
- *   "offscript": "...",
- *   "thanks": "...",
- *   "idle_warning": "...",
- *   "max_call_warning": "...",
- *   "questions": {
+ *  "system": "...",
+ *  "opening": "...",
+ *  "closing": "...",
+ *  "offscript": "...",
+ *  "thanks": "...",
+ *  "idle_warning": "...",
+ *  "max_call_warning": "...",
+ *  "questions": {
  *     "track": "...",
  *     "track_clarify": "...",
  *     "first": "...",
  *     "last": "...",
  *     "phone": "...",
- *     "phone_retry": "...",
- *     "email": "...",
- *     "email_retry": "..."
- *   }
+ *     "phone_retry": "..."
+ *  }
  * }
  */
 function parseConversationJson(raw) {
-  try {
-    const obj = JSON.parse(raw);
-    if (!obj || typeof obj !== "object") throw new Error("not object");
-    return obj;
-  } catch (e) {
-    throw new Error("MB_CONVERSATION_PROMPT must be valid JSON");
-  }
+  const obj = JSON.parse(raw);
+  if (!obj || typeof obj !== "object") throw new Error("not object");
+  return obj;
 }
 
 let CONV;
 try {
   CONV = parseConversationJson(MB_CONVERSATION_PROMPT_RAW);
 } catch (e) {
-  elog(e.message);
-  // hard fail: you asked for full control from one ENV; without it we should not run.
+  elog("MB_CONVERSATION_PROMPT must be valid JSON.");
   process.exit(1);
 }
 
-// getters with safety defaults
 function getStr(path, def = "") {
   const parts = path.split(".");
   let cur = CONV;
@@ -200,51 +190,25 @@ function getStr(path, def = "") {
   return typeof cur === "string" ? cur : def;
 }
 
-const SYS_PROMPT =
-  (getStr("system") || "") +
-  "\n\nהנחיית שפה ותמלול: השיחה בעברית. מונחים נפוצים: רבנות, דיינות, טוען רבני, מל\"מ. ";
-
-/* ------------------------- CRM senders ------------------------- */
-async function sendLeadFrontask(payload) {
-  if (!MB_FRONTASK_WEBTOLEAD_BASE) return { ok: false, reason: "frontask_not_configured" };
-
-  const params = new URLSearchParams();
-  params.set("type", "get");
-
-  params.set("FirstName", payload.first_name || "");
-  params.set("LastName", payload.last_name || "");
-  params.set("Phone", payload.phone_number || "");
-  params.set("MobilePhone", payload.phone_number || "");
-  params.set("Email", payload.email || "");
-
-  // optional fields
-  params.set("NamePrefix", "");
-  params.set("Title", "");
-  params.set("Address", "");
-  params.set("City", "");
-  params.set("AccountName", "");
-  params.set("Remarks", payload.remarks || "");
-
-  params.set("MailingList", MB_FRONTASK_MAILINGLIST);
-  if (MB_FRONTASK_SYSTEM_ID) params.set("SystemID", MB_FRONTASK_SYSTEM_ID);
-  if (MB_FRONTASK_PROCESS_STEP_ID) params.set("ProcessDefinitionStepID", MB_FRONTASK_PROCESS_STEP_ID);
-
-  params.set("RedirectTo", "");
-  params.set("UpdateExistingDetails", MB_FRONTASK_UPDATE_EXISTING);
-
-  const url = `${MB_FRONTASK_WEBTOLEAD_BASE}?${params.toString()}`;
-
-  try {
-    const res = await fetchWithTimeout(url, { method: "GET" }, 4500);
-    if (!res.ok) return { ok: false, reason: `frontask_http_${res.status}` };
-    return { ok: true, reason: "frontask_ok" };
-  } catch (e) {
-    return { ok: false, reason: `frontask_error_${e?.name || "err"}` };
+function renderTemplate(text, vars = {}) {
+  let out = String(text || "");
+  for (const [k, v] of Object.entries(vars)) {
+    const re = new RegExp(`\\{\\{\\s*${k}\\s*\\}\\}`, "g");
+    out = out.replace(re, String(v ?? ""));
   }
+  return out;
 }
 
-async function sendLeadWebhook(payload) {
-  if (!MB_WEBHOOK_URL) return { ok: false, reason: "webhook_not_configured" };
+/* Strong Hebrew + diacritics guidance (user requirement) */
+const SYS_PROMPT =
+  (getStr("system", "") || "") +
+  "\n\nכללי דיבור חובה: אתם גבר. שמכם מוטי. אתם מדברים בלשון רבים בלבד. " +
+  "הקפידו על עברית תקינה וברורה, ועדיפות לניקוד מלא בטקסטים שאתם מקריאים. " +
+  "חיזוק תמלול/מונחים: מל\"מ, רבנות, דיינות, טוען רבני.";
+
+/* ------------------------- CRM: Make webhook only ------------------------- */
+async function sendToMake(payload) {
+  if (!MB_WEBHOOK_URL) return { ok: false, reason: "make_webhook_not_configured" };
   try {
     const res = await fetchWithTimeout(
       MB_WEBHOOK_URL,
@@ -255,21 +219,11 @@ async function sendLeadWebhook(payload) {
       },
       4500
     );
-    if (!res.ok) return { ok: false, reason: `webhook_http_${res.status}` };
-    return { ok: true, reason: "webhook_ok" };
+    if (!res.ok) return { ok: false, reason: `make_http_${res.status}` };
+    return { ok: true, reason: "make_ok" };
   } catch (e) {
-    return { ok: false, reason: `webhook_error_${e?.name || "err"}` };
+    return { ok: false, reason: `make_error_${e?.name || "err"}` };
   }
-}
-
-async function deliverLead(payload) {
-  if (MB_FRONTASK_WEBTOLEAD_BASE) {
-    const r = await sendLeadFrontask(payload);
-    if (r.ok) return r;
-    if (MB_WEBHOOK_URL) return await sendLeadWebhook(payload);
-    return r;
-  }
-  return await sendLeadWebhook(payload);
 }
 
 /* ------------------------- Strict flow engine ------------------------- */
@@ -277,19 +231,21 @@ const STATES = {
   ASK_TRACK: "ASK_TRACK",
   ASK_FIRST: "ASK_FIRST",
   ASK_LAST: "ASK_LAST",
-  ASK_PHONE: "ASK_PHONE",
-  ASK_EMAIL: "ASK_EMAIL",
+  ASK_PHONE_CONFIRM: "ASK_PHONE_CONFIRM",
+  ASK_PHONE_MANUAL: "ASK_PHONE_MANUAL",
 };
 
 function isOffScriptQuestion(text) {
   const t = (text || "").trim();
   if (!t) return false;
-  // strict: any question / ask for details => offscript
-  return [/\?/, /תסביר/, /פרטים/, /הלכה/, /כמה עולה/, /מסלול/, /שיטה/, /תנאים/].some((re) => re.test(t));
+
+  // detect question-ish patterns
+  const patterns = [/\?/, /תסביר/, /פרטים/, /הלכה/, /שיטה/, /כמה עולה/, /תנאים/, /מסלול/];
+  return patterns.some((re) => re.test(t));
 }
 
 function graceMs() {
-  return Math.max(2000, Math.min(MB_HANGUP_GRACE_MS, 8000));
+  return Math.max(2500, Math.min(MB_HANGUP_GRACE_MS, 9000));
 }
 
 /* ------------------------- server ------------------------- */
@@ -304,26 +260,27 @@ wss.on("connection", (twilioWs) => {
   let callSid = null;
   let caller = "";
   let called = "";
-  let source = "Voice AI - Nice Line";
 
+  let callerPhoneLocal = ""; // normalized 05xxxxxxxx
   let state = STATES.ASK_TRACK;
+
   let openAiReady = false;
   let callEnded = false;
   let leadSent = false;
 
-  // for idle
+  // idle
   let lastMediaTs = Date.now();
   let idleWarned = false;
 
-  // barge-in handling
+  // barge-in
   let botSpeaking = false;
   let noListenUntilTs = 0;
 
-  // outgoing audio buffer until streamSid exists (prevents cut opening)
+  // buffer audio until streamSid exists (prevents opening cut)
   const outAudioBuffer = [];
-  const MAX_AUDIO_BUFFER = 400;
+  const MAX_AUDIO_BUFFER = 500;
 
-  // response queue (prevents overlap)
+  // response queue to avoid overlapping responses
   let responseInFlight = false;
   const responseQueue = [];
 
@@ -331,20 +288,21 @@ wss.on("connection", (twilioWs) => {
     first_name: "",
     last_name: "",
     phone_number: "",
-    email: "",
     study_track: "",
     source: "Voice AI - Nice Line",
     timestamp: "",
+    caller_id: "",
+    called: "",
   };
 
-  function logState(note) {
-    ilog(`[STATE] ${state}${note ? " | " + note : ""}`);
-  }
-  function logBot(text) {
+  function ilogBot(text) {
     ilog("BOT>", text);
   }
-  function logUser(text) {
+  function ilogUser(text) {
     ilog("USER>", text);
+  }
+  function logState(note) {
+    ilog(`[STATE] ${state}${note ? " | " + note : ""}`);
   }
 
   function enqueueTextPrompt(text, why = "") {
@@ -371,46 +329,72 @@ wss.on("connection", (twilioWs) => {
     openAiWs.send(JSON.stringify({ type: "response.create" }));
   }
 
-  async function deliver(call_status, reason) {
+  function speakOneSentenceExact(heText, why) {
+    const line = String(heText || "").trim();
+    if (!line) return;
+    // instruct the model to read EXACTLY, with niqqud preference, plural-only
+    enqueueTextPrompt(
+      `הקריאו בדיוק את המשפט הבא בעברית, בלשון רבים בלבד, כגבר (מוטי), ועדיפות לניקוד מלא. בלי להוסיף שום דבר: "${line}"`,
+      why
+    );
+    ilogBot(line);
+  }
+
+  function answerQuestionThenResume(userText) {
+    const off = getStr("offscript", "אני מערכת רישום בלבד. נציג יחזור אליכם עם כל ההסברים.");
+    // Try to answer if answer exists in system/knowledge; else fallback to generic offscript
+    enqueueTextPrompt(
+      `השואל אמר: "${userText}". אם יש תשובה ברורה מתוך ההנחיות/הידע שקיים אצלכם – ענו בקצרה במשפט אחד. אם אין תשובה ודאית – ענו בדיוק: "${off}". לאחר מכן אל תשאלו שאלות חדשות, וחזרו לתסריט.`,
+      "qa_or_fallback"
+    );
+    // then repeat current scripted question
+    askCurrent();
+  }
+
+  async function deliver(callStatusHe, callStatusCode, reason) {
     if (leadSent) return;
     leadSent = true;
+
+    lead.timestamp = lead.timestamp || nowIso();
 
     const payload = {
       first_name: lead.first_name || "",
       last_name: lead.last_name || "",
-      phone_number: lead.phone_number || normalizeIsraeliPhone("", caller) || "",
-      email: lead.email || "",
+      phone_number: lead.phone_number || "", // chosen/confirmed phone
       study_track: lead.study_track || "",
-      call_status,
-      source,
-      timestamp: lead.timestamp || nowIso(),
-      caller_id: caller || "",
-      called: called || "",
+      source: lead.source || "Voice AI - Nice Line",
+      timestamp: lead.timestamp,
+
+      // always include caller id
+      caller_id: lead.caller_id || caller || "",
+      called: lead.called || called || "",
       callSid: callSid || "",
       streamSid: streamSid || "",
+
+      // statuses
+      call_status: callStatusHe, // "שיחה מלאה" / "שיחה חלקית"
+      call_status_code: callStatusCode, // "completed" / "partial"
       reason: reason || "",
-      remarks: `מסלול: ${lead.study_track || ""} | סטטוס: ${call_status} | caller: ${caller || ""} | callSid: ${
-        callSid || ""
-      }`,
+
+      // debug-friendly remarks
+      remarks: `מסלול: ${lead.study_track || ""} | סטטוס: ${callStatusHe} | caller: ${lead.caller_id || caller || ""} | callSid: ${callSid || ""}`,
     };
 
     ilog("CRM> sending", safePayload(payload));
-    const r = await deliverLead(payload);
+    const r = await sendToMake(payload);
     ilog("CRM> result", r);
     if (!r.ok) elog("CRM> FAILED", r);
   }
 
-  async function finish(status, reason) {
+  async function finish(callStatusHe, callStatusCode, reason) {
     if (callEnded) return;
     callEnded = true;
 
-    lead.timestamp = lead.timestamp || nowIso();
-    await deliver(status, reason);
+    await deliver(callStatusHe, callStatusCode, reason);
 
     const closing = getStr("closing", "");
     if (closing) {
-      enqueueTextPrompt(`אמרו במשפט אחד בלבד: "${closing}"`, "closing");
-      logBot(closing);
+      speakOneSentenceExact(closing, "closing");
     }
 
     setTimeout(() => {
@@ -423,29 +407,30 @@ wss.on("connection", (twilioWs) => {
     }, graceMs());
   }
 
-  function sayThanksThen(nextState) {
+  function sayThanks() {
     const thanks = getStr("thanks", "תודה.");
-    if (thanks) {
-      enqueueTextPrompt(`אמרו בקצרה: "${thanks}"`, "thanks");
-      logBot(thanks);
-    }
-    state = nextState;
-    logState("next");
-    askCurrent();
+    if (thanks) speakOneSentenceExact(thanks, "thanks");
   }
 
   function askCurrent() {
     const qs = CONV.questions || {};
     let q = "";
+
     if (state === STATES.ASK_TRACK) q = qs.track || "";
     if (state === STATES.ASK_FIRST) q = qs.first || "";
     if (state === STATES.ASK_LAST) q = qs.last || "";
-    if (state === STATES.ASK_PHONE) q = qs.phone || "";
-    if (state === STATES.ASK_EMAIL) q = qs.email || "";
+
+    if (state === STATES.ASK_PHONE_CONFIRM) {
+      const templ = qs.phone || "";
+      q = renderTemplate(templ, { caller_phone: callerPhoneLocal || "" });
+    }
+
+    if (state === STATES.ASK_PHONE_MANUAL) {
+      q = "אנא אמרו את מספר הטלפון בספרות בלבד, לאט וברור.";
+    }
 
     if (!q) return;
-    enqueueTextPrompt(`שאלו במשפט אחד בלבד: "${q}"`, `ask_${state}`);
-    logBot(q);
+    speakOneSentenceExact(q, `ask_${state}`);
   }
 
   /* ------------------------- OpenAI Realtime WS ------------------------- */
@@ -475,19 +460,15 @@ wss.on("connection", (twilioWs) => {
             silence_duration_ms: MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS,
             prefix_padding_ms: MB_VAD_PREFIX_MS,
           },
-          max_response_output_tokens: 280,
+          max_response_output_tokens: 240,
           instructions: SYS_PROMPT,
         },
       })
     );
 
     const opening = getStr("opening", "");
-    if (opening) {
-      enqueueTextPrompt(`אמרו את הפתיחה הבאה בלבד (בלי להוסיף שום דבר): "${opening}"`, "opening");
-      logBot(opening);
-    }
+    if (opening) speakOneSentenceExact(opening, "opening");
 
-    // then first question
     askCurrent();
     logState("start");
   });
@@ -500,6 +481,7 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
+    // audio out
     if (msg.type === "response.audio.delta") {
       botSpeaking = true;
       noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
@@ -512,114 +494,126 @@ wss.on("connection", (twilioWs) => {
       twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
       return;
     }
-
     if (msg.type === "response.audio.done") {
       botSpeaking = false;
       return;
     }
 
+    // response lifecycle
     if (msg.type === "response.completed") {
       responseInFlight = false;
       pumpQueue();
       return;
     }
 
+    // transcription
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const userText = (msg.transcript || "").trim();
       if (!userText || callEnded) return;
 
-      logUser(userText);
+      ilogUser(userText);
 
-      // Offscript
+      // Q/A handling (answer if possible, else generic) then resume script
       if (isOffScriptQuestion(userText)) {
-        const off = getStr("offscript", "");
-        if (off) {
-          enqueueTextPrompt(`ענו במשפט אחד בלבד: "${off}"`, "offscript");
-          logBot(off);
-        }
-        askCurrent();
+        answerQuestionThenResume(userText);
         return;
       }
 
-      // Flow
+      // FLOW
       if (state === STATES.ASK_TRACK) {
         const tr = normalizeStudyTrack(userText);
         if (!tr) {
-          const clarify = (CONV.questions && CONV.questions.track_clarify) || getStr("questions.track_clarify", "");
-          if (clarify) {
-            enqueueTextPrompt(`אמרו במשפט אחד בלבד: "${clarify}"`, "track_clarify");
-            logBot(clarify);
-          }
+          const clarify = getStr("questions.track_clarify", "");
+          if (clarify) speakOneSentenceExact(clarify, "track_clarify");
           askCurrent();
           return;
         }
         lead.study_track = tr;
-        sayThanksThen(STATES.ASK_FIRST);
+        sayThanks();
+        state = STATES.ASK_FIRST;
+        logState("next");
+        askCurrent();
         return;
       }
 
       if (state === STATES.ASK_FIRST) {
         lead.first_name = userText;
-        sayThanksThen(STATES.ASK_LAST);
+        sayThanks();
+        state = STATES.ASK_LAST;
+        logState("next");
+        askCurrent();
         return;
       }
 
       if (state === STATES.ASK_LAST) {
         lead.last_name = userText;
-        sayThanksThen(STATES.ASK_PHONE);
+        sayThanks();
+        state = STATES.ASK_PHONE_CONFIRM;
+        logState("next");
+        askCurrent();
         return;
       }
 
-      if (state === STATES.ASK_PHONE) {
-        const phone = normalizeIsraeliPhone(userText, caller);
-        if (!phone) {
-          if (!lead.__phone_retry) {
-            lead.__phone_retry = true;
-            const retry = (CONV.questions && CONV.questions.phone_retry) || "";
-            if (retry) {
-              enqueueTextPrompt(`אמרו במשפט אחד בלבד: "${retry}"`, "phone_retry");
-              logBot(retry);
-            }
-            askCurrent();
-            return;
-          }
-          await finish("partial", "invalid_phone_twice");
-          return;
-        }
-        lead.phone_number = phone;
-        sayThanksThen(STATES.ASK_EMAIL);
-        return;
-      }
+      if (state === STATES.ASK_PHONE_CONFIRM) {
+        // If caller id exists, accept "yes" to use it. Or accept digits for new phone.
+        const proposed = callerPhoneLocal || normalizeIsraeliPhone("", caller) || "";
 
-      if (state === STATES.ASK_EMAIL) {
-        const t = userText.toLowerCase();
-        const saysNo = t.includes("אין") || t.includes("לא") || t.includes("בלי");
-
-        if (saysNo) {
-          lead.email = "";
-          await finish("completed", "done_no_email");
+        // user says yes
+        if (proposed && isYes(userText)) {
+          lead.phone_number = proposed;
+          await finish("שיחה מלאה", "completed", "done_confirmed_caller");
           return;
         }
 
-        if (isValidEmailLike(userText)) {
-          lead.email = userText.trim();
-          await finish("completed", "done_with_email");
+        // user provides digits
+        const phone = normalizeIsraeliPhone(userText, "");
+        if (phone) {
+          lead.phone_number = phone;
+          await finish("שיחה מלאה", "completed", "done_manual_phone");
           return;
         }
 
-        if (!lead.__email_retry) {
-          lead.__email_retry = true;
-          const retry = (CONV.questions && CONV.questions.email_retry) || "";
-          if (retry) {
-            enqueueTextPrompt(`אמרו במשפט אחד בלבד: "${retry}"`, "email_retry");
-            logBot(retry);
-          }
+        // user says no / doesn't want caller id -> ask manual once
+        if (isNo(userText)) {
+          state = STATES.ASK_PHONE_MANUAL;
+          logState("to_manual");
           askCurrent();
           return;
         }
 
-        lead.email = "";
-        await finish("completed", "done_email_skipped");
+        // unclear: retry once with phone_retry, then move to manual
+        if (!lead.__phone_retry) {
+          lead.__phone_retry = true;
+          const retry = getStr("questions.phone_retry", "");
+          if (retry) speakOneSentenceExact(retry, "phone_retry");
+          askCurrent();
+          return;
+        }
+
+        state = STATES.ASK_PHONE_MANUAL;
+        logState("fallback_manual");
+        askCurrent();
+        return;
+      }
+
+      if (state === STATES.ASK_PHONE_MANUAL) {
+        const phone = normalizeIsraeliPhone(userText, "");
+        if (phone) {
+          lead.phone_number = phone;
+          await finish("שיחה מלאה", "completed", "done_manual_after_prompt");
+          return;
+        }
+
+        if (!lead.__manual_phone_retry) {
+          lead.__manual_phone_retry = true;
+          const retry = getStr("questions.phone_retry", "");
+          if (retry) speakOneSentenceExact(retry, "phone_retry_manual");
+          askCurrent();
+          return;
+        }
+
+        // partial end
+        await finish("שיחה חלקית", "partial", "invalid_phone_twice");
         return;
       }
     }
@@ -634,13 +628,14 @@ wss.on("connection", (twilioWs) => {
   openAiWs.on("close", async () => {
     if (!callEnded) {
       elog("OpenAI WS closed");
-      await finish("partial", "openai_closed");
+      await finish("שיחה חלקית", "partial", "openai_closed");
     }
   });
+
   openAiWs.on("error", async (e) => {
     if (!callEnded) {
       elog("OpenAI WS error", e?.message || e);
-      await finish("partial", "openai_ws_error");
+      await finish("שיחה חלקית", "partial", "openai_ws_error");
     }
   });
 
@@ -652,33 +647,29 @@ wss.on("connection", (twilioWs) => {
     if (!idleWarned && since >= MB_IDLE_WARNING_MS) {
       idleWarned = true;
       const warn = getStr("idle_warning", "");
-      if (warn) {
-        enqueueTextPrompt(`אמרו במשפט אחד בלבד: "${warn}"`, "idle_warning");
-        logBot(warn);
-      }
+      if (warn) speakOneSentenceExact(warn, "idle_warning");
     }
+
     if (since >= MB_IDLE_HANGUP_MS) {
-      await finish("partial", "idle_timeout");
+      await finish("שיחה חלקית", "partial", "idle_timeout");
       clearInterval(idleInterval);
     }
   }, 1000);
 
-  let maxWarnT = null,
-    maxEndT = null;
+  let maxWarnT = null;
+  let maxEndT = null;
+
   if (MB_MAX_CALL_MS > 0) {
     if (MB_MAX_WARN_BEFORE_MS > 0 && MB_MAX_CALL_MS > MB_MAX_WARN_BEFORE_MS) {
       maxWarnT = setTimeout(() => {
         if (!callEnded) {
           const warn = getStr("max_call_warning", "");
-          if (warn) {
-            enqueueTextPrompt(`אמרו במשפט אחד בלבד: "${warn}"`, "max_call_warning");
-            logBot(warn);
-          }
+          if (warn) speakOneSentenceExact(warn, "max_call_warning");
         }
       }, MB_MAX_CALL_MS - MB_MAX_WARN_BEFORE_MS);
     }
     maxEndT = setTimeout(async () => {
-      if (!callEnded) await finish("partial", "max_call_duration");
+      if (!callEnded) await finish("שיחה חלקית", "partial", "max_call_duration");
     }, MB_MAX_CALL_MS);
   }
 
@@ -698,9 +689,13 @@ wss.on("connection", (twilioWs) => {
       const p = msg.start?.customParameters || {};
       caller = p.caller || "";
       called = p.called || "";
-      source = p.source || source;
 
-      ilog("CALL start", { streamSid, callSid, caller, called });
+      lead.caller_id = caller || "";
+      lead.called = called || "";
+
+      callerPhoneLocal = normalizeIsraeliPhone("", caller) || "";
+
+      ilog("CALL start", { streamSid, callSid, caller, called, callerPhoneLocal });
 
       // flush buffered audio once streamSid exists
       if (streamSid && outAudioBuffer.length) {
@@ -729,12 +724,8 @@ wss.on("connection", (twilioWs) => {
 
     if (msg.event === "stop") {
       if (!callEnded) {
-        const enough =
-          lead.study_track &&
-          lead.first_name &&
-          lead.last_name &&
-          (lead.phone_number || normalizeIsraeliPhone("", caller));
-        finish(enough ? "completed" : "partial", "twilio_stop");
+        const full = !!(lead.study_track && lead.first_name && lead.last_name && (lead.phone_number || callerPhoneLocal));
+        finish(full ? "שיחה מלאה" : "שיחה חלקית", full ? "completed" : "partial", "twilio_stop");
       }
     }
   });
