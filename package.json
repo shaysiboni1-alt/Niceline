@@ -1,14 +1,13 @@
 {
-  "name": "niceline-voice-bot",
+  "name": "niceline-voice-ai",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
-  "scripts": { "start": "node server.js" },
-  "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "twilio": "^5.3.1",
-    "ws": "^8.18.0"
+  "scripts": {
+    "start": "node server.js"
   },
-  "engines": { "node": ">=18" }
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
 }
