@@ -1,13 +1,13 @@
 // server.js
-// Malam – Voice AI (Inbound) – STRICT RECEPTION FLOW
+// NiceLine – Malam Voice AI (Inbound) – STRICT FLOW + ALL-CALL RECORDING
 // Twilio Media Streams <-> OpenAI Realtime API
 //
-// Key changes:
-// - Opening/Closing are NOT in MB_CONVERSATION_PROMPT anymore.
-//   They are controlled via ENV: MB_OPENING_TEXT / MB_CLOSING_TEXT
-// - On twilio_stop (call already ended) we DO NOT attempt to speak closing.
-// - Strict per-call reset (new WS, new state, clean queues)
-// - Always send caller_id + status to Make; no email.
+// Features:
+// - Opening / Closing are ENV controlled (MB_OPENING_TEXT / MB_CLOSING_TEXT)
+// - Strict per-call reset
+// - Fix OpenAI Realtime: temperature must be >= 0.6 (set to 0.6)
+// - Start Twilio call recording "ALL CALL" via REST on call start
+// - Receive RecordingUrl via /twilio-recording-callback and send to Make
 //
 // npm i express ws dotenv
 // node server.js
@@ -96,26 +96,29 @@ function renderTemplate(text, vars = {}) {
   }
   return out;
 }
+function base64BasicAuth(user, pass) {
+  return Buffer.from(`${user}:${pass}`, "utf8").toString("base64");
+}
 
 /* ------------------------- config ------------------------- */
 const PORT = envNum("PORT", 10000);
 
-// OpenAI
 const OPENAI_API_KEY = envStr("OPENAI_API_KEY", "");
 const OPENAI_VOICE = envStr("OPENAI_VOICE", "cedar");
 
-// PROMPT JSON (system + questions + guardrail + retries)
 const MB_CONVERSATION_PROMPT_RAW = envStr("MB_CONVERSATION_PROMPT", "");
-
-// Opening/Closing separated (YOU control fully)
 const MB_OPENING_TEXT = envStr("MB_OPENING_TEXT", "");
 const MB_CLOSING_TEXT = envStr("MB_CLOSING_TEXT", "");
 
-// Webhook (Make)
 const MB_WEBHOOK_URL = envStr("MB_WEBHOOK_URL", "").trim();
 
-// Debug
 const MB_DEBUG = envBool("MB_DEBUG", true);
+
+// Recording (All call)
+const MB_ENABLE_RECORDING = envBool("MB_ENABLE_RECORDING", false);
+const MB_RECORDING_STATUS_CALLBACK_URL = envStr("MB_RECORDING_STATUS_CALLBACK_URL", "").trim();
+const TWILIO_ACCOUNT_SID = envStr("TWILIO_ACCOUNT_SID", "");
+const TWILIO_AUTH_TOKEN = envStr("TWILIO_AUTH_TOKEN", "");
 
 // Noise / VAD
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
@@ -132,9 +135,8 @@ const MB_IDLE_WARNING_MS = envNum("MB_IDLE_WARNING_MS", 25000);
 const MB_IDLE_HANGUP_MS = envNum("MB_IDLE_HANGUP_MS", 55000);
 const MB_MAX_CALL_MS = envNum("MB_MAX_CALL_MS", 3 * 60 * 1000);
 const MB_MAX_WARN_BEFORE_MS = envNum("MB_MAX_WARN_BEFORE_MS", 25000);
-const MB_HANGUP_GRACE_MS = envNum("MB_HANGUP_GRACE_MS", 4500);
 
-// response safety
+// Response safety
 const MB_RESPONSE_FAILSAFE_MS = envNum("MB_RESPONSE_FAILSAFE_MS", 12000);
 
 function ilog(...a) { console.log("[INFO]", ...a); }
@@ -146,6 +148,11 @@ if (!MB_CONVERSATION_PROMPT_RAW) elog("[FATAL] Missing MB_CONVERSATION_PROMPT");
 if (!MB_OPENING_TEXT) ilog("[WARN] Missing MB_OPENING_TEXT");
 if (!MB_CLOSING_TEXT) ilog("[WARN] Missing MB_CLOSING_TEXT");
 if (!MB_WEBHOOK_URL) ilog("[WARN] Missing MB_WEBHOOK_URL (Make) – will not push leads.");
+
+if (MB_ENABLE_RECORDING) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) elog("[FATAL] Recording enabled but missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN");
+  if (!MB_RECORDING_STATUS_CALLBACK_URL) elog("[FATAL] Recording enabled but missing MB_RECORDING_STATUS_CALLBACK_URL");
+}
 
 /* ------------------------- prompt JSON ------------------------- */
 const CONV = safeJsonParse(MB_CONVERSATION_PROMPT_RAW, null);
@@ -179,15 +186,93 @@ async function sendToMake(payload) {
   }
 }
 
-/* ------------------------- server ------------------------- */
+/* ------------------------- Twilio Recording (REST) ------------------------- */
+async function startTwilioRecording(callSid) {
+  if (!MB_ENABLE_RECORDING) return { ok: false, reason: "recording_disabled" };
+  if (!callSid) return { ok: false, reason: "missing_callSid" };
+
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
+
+  const body = new URLSearchParams({
+    RecordingStatusCallback: MB_RECORDING_STATUS_CALLBACK_URL,
+    RecordingStatusCallbackEvent: "completed",
+    RecordingStatusCallbackMethod: "POST"
+  });
+
+  try {
+    const res = await fetchWithTimeout(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${base64BasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body
+    }, 6000);
+
+    if (!res.ok) return { ok: false, reason: `twilio_rec_http_${res.status}` };
+    const json = await res.json();
+    return { ok: true, reason: "recording_started", sid: json.sid || "" };
+  } catch (e) {
+    return { ok: false, reason: `twilio_rec_error_${e?.name || "err"}` };
+  }
+}
+
+/* ------------------------- Recording URL store ------------------------- */
+// Store for a short time (calls finish fast). Key = CallSid
+const recordingByCallSid = new Map();
+function setRecordingUrl(callSid, url) {
+  if (!callSid || !url) return;
+  recordingByCallSid.set(callSid, url);
+  // auto cleanup after 2 hours
+  setTimeout(() => recordingByCallSid.delete(callSid), 2 * 60 * 60 * 1000).unref?.();
+}
+function getRecordingUrl(callSid) {
+  return recordingByCallSid.get(callSid) || "";
+}
+
+/* ------------------------- Express ------------------------- */
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
+app.use(express.json());
+app.use(express.urlencoded({ extended: false })); // for Twilio form callbacks
 
 app.get("/health", (_req, res) => res.json({ ok: true, time: nowIso() }));
 
+// Twilio Voice webhook: point your Twilio number to POST https://niceline.onrender.com/twilio-voice
+app.post("/twilio-voice", (req, res) => {
+  // Important: stream uses WSS + your domain
+  const wsUrl = "wss://niceline.onrender.com/twilio-media-stream";
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}">
+      <Parameter name="caller" value="${req.body.From || ""}"/>
+      <Parameter name="called" value="${req.body.To || ""}"/>
+    </Stream>
+  </Connect>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
+});
+
+// Twilio will POST RecordingUrl here when completed
+app.post("/twilio-recording-callback", (req, res) => {
+  const callSid = req.body.CallSid || req.body.callSid || "";
+  const recordingUrl = req.body.RecordingUrl || req.body.recordingUrl || "";
+
+  ilog("RECORDING callback", { callSid, recordingUrl });
+
+  if (callSid && recordingUrl) {
+    setRecordingUrl(callSid, recordingUrl);
+  }
+  res.status(200).send("ok");
+});
+
+/* ------------------------- WS: Media Stream ------------------------- */
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
+
 wss.on("connection", (twilioWs) => {
-  // ---- per call reset (everything inside connection) ----
   let streamSid = "";
   let callSid = "";
   let caller = "";
@@ -231,25 +316,16 @@ wss.on("connection", (twilioWs) => {
     source: "Voice AI - Nice Line",
     timestamp: "",
     caller_id: "",
-    called: "",
+    called: ""
   };
 
-  function logState(note) {
-    ilog(`[STATE] ${state}${note ? " | " + note : ""}`);
-  }
-  function logBot(text) {
-    ilog("BOT>", text);
-  }
-  function logUser(text) {
-    ilog("USER>", text);
-  }
+  function logState(note) { ilog(`[STATE] ${state}${note ? " | " + note : ""}`); }
+  function logBot(text) { ilog("BOT>", text); }
+  function logUser(text) { ilog("USER>", text); }
 
   function clearInFlight() {
     responseInFlight = false;
-    if (responseTimer) {
-      clearTimeout(responseTimer);
-      responseTimer = null;
-    }
+    if (responseTimer) { clearTimeout(responseTimer); responseTimer = null; }
   }
   function startInFlightFailsafe() {
     if (responseTimer) clearTimeout(responseTimer);
@@ -304,6 +380,8 @@ wss.on("connection", (twilioWs) => {
     if (leadSent) return;
     leadSent = true;
 
+    const recording_url = getRecordingUrl(callSid) || "";
+
     const payload = {
       first_name: lead.first_name || "",
       last_name: lead.last_name || "",
@@ -321,7 +399,9 @@ wss.on("connection", (twilioWs) => {
       call_status_code: statusCode,
       reason: reason || "",
 
-      remarks: `סטטוס: ${statusHe} | caller: ${lead.caller_id || caller || ""} | callSid: ${callSid || ""}`,
+      recording_url,
+
+      remarks: `סטטוס: ${statusHe} | caller: ${lead.caller_id || caller || ""} | callSid: ${callSid || ""}`
     };
 
     ilog("CRM> sending", payload);
@@ -341,9 +421,8 @@ wss.on("connection", (twilioWs) => {
       setTimeout(() => {
         try { openAiWs?.close(); } catch {}
         try { twilioWs?.close(); } catch {}
-      }, Math.max(2500, Math.min(MB_HANGUP_GRACE_MS, 9000)));
+      }, 3500);
     } else {
-      // call already ended -> just close sockets silently
       try { openAiWs?.close(); } catch {}
       try { twilioWs?.close(); } catch {}
     }
@@ -356,7 +435,7 @@ wss.on("connection", (twilioWs) => {
 
   /* ------------------------- OpenAI Realtime WS ------------------------- */
   const openAiWs = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17", {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" },
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
   });
 
   openAiWs.on("open", () => {
@@ -371,22 +450,24 @@ wss.on("connection", (twilioWs) => {
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
         input_audio_transcription: { model: "whisper-1" },
-        // keep it deterministic
-        temperature: 0,
+
+        // IMPORTANT: your model requires temperature >= 0.6
+        temperature: 0.6,
+
         turn_detection: {
           type: "server_vad",
           threshold: MB_VAD_THRESHOLD,
           silence_duration_ms: MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS,
           prefix_padding_ms: MB_VAD_PREFIX_MS
         },
+
         max_response_output_tokens: 140,
-        instructions: (getStr("system", "") || "") +
-          "\n\nחוקים קשיחים: אתם גבר בשם מוטי. עברית תקינה, לשון רבים בלבד. " +
-          "אין לאסוף אימייל. אין לשנות ניסוחים. כל שאלה על מחיר/תוכן/מועדים/התאמה/הלכה => guardrail ואז סיום."
+        instructions:
+          (getStr("system", "") || "") +
+          "\n\nחוקים קשיחים: אתם גבר בשם מוטי. עברית תקינה, לשון רבים בלבד. אין לאסוף אימייל. אין לשנות ניסוחים."
       }
     }));
 
-    // flush buffered Twilio->OpenAI audio
     while (inAudioBuffer.length) {
       const b64 = inAudioBuffer.shift();
       openAiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
@@ -427,7 +508,7 @@ wss.on("connection", (twilioWs) => {
 
       logUser(userText);
 
-      if (looksLikeQuestionAboutInfo(userText) && state !== STATES.CONFIRM_PHONE_MANUAL) {
+      if (looksLikeQuestionAboutInfo(userText)) {
         guardrailAndClose();
         return;
       }
@@ -475,7 +556,7 @@ wss.on("connection", (twilioWs) => {
           askCurrent();
           return;
         }
-        speakExact(getStr("questions.confirm_caller_phone_retry", "אפשר לענות רק כן או לא. זה המספר הנכון לחזרה?"), "confirm_retry");
+        speakExact(getStr("questions.confirm_caller_phone_retry", "אפשר לענות רק כן או לא. זה המספר הנכון?"), "confirm_retry");
         return;
       }
 
@@ -511,7 +592,7 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "error") {
       const code = msg?.error?.code;
       elog("OpenAI error", msg);
-      if (code === "conversation_already_has_active_response") return; // keep lock
+      if (code === "conversation_already_has_active_response") return;
       clearInFlight();
       pumpSpeakQueue();
     }
@@ -548,7 +629,7 @@ wss.on("connection", (twilioWs) => {
   if (MB_MAX_CALL_MS > 0) {
     if (MB_MAX_WARN_BEFORE_MS > 0 && MB_MAX_CALL_MS > MB_MAX_WARN_BEFORE_MS) {
       maxWarnT = setTimeout(() => {
-        if (!callEnded) speakExact(getStr("max_call_warning", ""), "max_call_warning");
+        if (!callEnded) speakExact("עוֹד מְעַט נְסַיֵּם כְּדֵי לְשְׁמֹר עַל זְמַן הַשִּׂיחָה.", "max_call_warning");
       }, MB_MAX_CALL_MS - MB_MAX_WARN_BEFORE_MS);
     }
     maxEndT = setTimeout(async () => {
@@ -557,7 +638,7 @@ wss.on("connection", (twilioWs) => {
   }
 
   /* ------------------------- Twilio WS ------------------------- */
-  twilioWs.on("message", (data) => {
+  twilioWs.on("message", async (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
@@ -576,6 +657,13 @@ wss.on("connection", (twilioWs) => {
       callerPhoneLocal = normalizeIsraeliPhone("", caller) || "";
 
       ilog("CALL start", { streamSid, callSid, caller, called, callerPhoneLocal });
+
+      // Start ALL-CALL recording
+      if (MB_ENABLE_RECORDING) {
+        const rr = await startTwilioRecording(callSid);
+        ilog("RECORDING>", rr);
+        if (!rr.ok) elog("RECORDING FAILED>", rr);
+      }
 
       // flush buffered OpenAI->Twilio audio
       if (streamSid && outAudioBuffer.length) {
@@ -609,8 +697,7 @@ wss.on("connection", (twilioWs) => {
 
     if (msg.event === "stop") {
       const full = !!(lead.first_name && (lead.phone_number || callerPhoneLocal));
-      // call already ended -> no closing speech attempt
-      finish(full ? "שיחה מלאה" : "שיחה חלקית", full ? "completed" : "partial", "twilio_stop", { speakClosing: false });
+      await finish(full ? "שיחה מלאה" : "שיחה חלקית", full ? "completed" : "partial", "twilio_stop", { speakClosing: false });
     }
   });
 
