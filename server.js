@@ -2,10 +2,10 @@
 // Nice Line – Voice AI (Inbound)
 // Twilio Media Streams <-> OpenAI Realtime API
 //
-// ONE SCRIPT CONTROL ENV:
-// - MB_CONVERSATION_PROMPT (JSON) controls system/opening/closing/questions.
-// Engine is strict: track -> first -> last -> phone(confirm caller id).
-// No email step.
+// FIX v2:
+// - Response queue no longer depends only on "response.completed".
+// - Releases queue on: response.audio.done OR response.done OR response.completed.
+// - Adds failsafe timeout so queue never gets stuck.
 //
 // npm i express ws dotenv
 // node server.js
@@ -36,7 +36,7 @@ const PORT = envNum("PORT", 10000);
 
 // OpenAI
 const OPENAI_API_KEY = envStr("OPENAI_API_KEY", "");
-const OPENAI_VOICE = envStr("OPENAI_VOICE", "cedar"); // supported: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
+const OPENAI_VOICE = envStr("OPENAI_VOICE", "cedar");
 
 // Single conversation env (JSON)
 const MB_CONVERSATION_PROMPT_RAW = envStr("MB_CONVERSATION_PROMPT", "");
@@ -45,7 +45,7 @@ const MB_CONVERSATION_PROMPT_RAW = envStr("MB_CONVERSATION_PROMPT", "");
 const MB_DEBUG = envBool("MB_DEBUG", true);
 const MB_REDACT_LOGS = envBool("MB_REDACT_LOGS", false);
 
-// VAD + background noise tuning (stable)
+// VAD + background noise tuning
 const MB_VAD_THRESHOLD = envNum("MB_VAD_THRESHOLD", 0.65);
 const MB_VAD_SILENCE_MS = envNum("MB_VAD_SILENCE_MS", 900);
 const MB_VAD_PREFIX_MS = envNum("MB_VAD_PREFIX_MS", 200);
@@ -94,7 +94,6 @@ function normalizeIsraeliPhone(raw, fallbackCaller) {
   if (!d && fallbackCaller) d = digitsOnly(fallbackCaller);
   if (!d) return null;
 
-  // if E.164 like +9725...
   if (d.startsWith("972")) {
     d = "0" + d.slice(3);
   }
@@ -107,7 +106,6 @@ function normalizeStudyTrack(raw) {
   const t = String(raw || "").trim().toLowerCase();
   if (!t) return null;
 
-  // common variations / STT confusions
   if (t.includes("טוען")) return "טוען רבני";
   if (t.includes("דיינ") || t.includes("דיין") || t.includes("דיינות")) return "דיינות";
   if (t.includes("רבנ") || t.includes("רבנות") || t === "רב") return "רבנות";
@@ -116,11 +114,11 @@ function normalizeStudyTrack(raw) {
 
 function isYes(text) {
   const t = String(text || "").trim().toLowerCase();
-  return ["כן", "בטח", "בוודאי", "נכון", "כן כן", "יאפ", "כן.", "כן!"].some((w) => t === w || t.includes(w));
+  return ["כן", "בטח", "בוודאי", "נכון", "כן כן", "יאפ"].some((w) => t === w || t.includes(w));
 }
 function isNo(text) {
   const t = String(text || "").trim().toLowerCase();
-  return ["לא", "ממש לא", "לא תודה", "שלילי", "לא.", "לא!"].some((w) => t === w || t.includes(w));
+  return ["לא", "לא תודה", "שלילי"].some((w) => t === w || t.includes(w));
 }
 
 function redactPhone(p) {
@@ -146,26 +144,6 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 4500) {
 }
 
 /* ------------------------- Conversation prompt (single ENV) ------------------------- */
-/**
- * MB_CONVERSATION_PROMPT JSON keys expected:
- * {
- *  "system": "...",
- *  "opening": "...",
- *  "closing": "...",
- *  "offscript": "...",
- *  "thanks": "...",
- *  "idle_warning": "...",
- *  "max_call_warning": "...",
- *  "questions": {
- *     "track": "...",
- *     "track_clarify": "...",
- *     "first": "...",
- *     "last": "...",
- *     "phone": "...",
- *     "phone_retry": "..."
- *  }
- * }
- */
 function parseConversationJson(raw) {
   const obj = JSON.parse(raw);
   if (!obj || typeof obj !== "object") throw new Error("not object");
@@ -199,7 +177,7 @@ function renderTemplate(text, vars = {}) {
   return out;
 }
 
-/* Strong Hebrew + diacritics guidance (user requirement) */
+/* Strong Hebrew + diacritics guidance */
 const SYS_PROMPT =
   (getStr("system", "") || "") +
   "\n\nכללי דיבור חובה: אתם גבר. שמכם מוטי. אתם מדברים בלשון רבים בלבד. " +
@@ -238,8 +216,6 @@ const STATES = {
 function isOffScriptQuestion(text) {
   const t = (text || "").trim();
   if (!t) return false;
-
-  // detect question-ish patterns
   const patterns = [/\?/, /תסביר/, /פרטים/, /הלכה/, /שיטה/, /כמה עולה/, /תנאים/, /מסלול/];
   return patterns.some((re) => re.test(t));
 }
@@ -261,7 +237,7 @@ wss.on("connection", (twilioWs) => {
   let caller = "";
   let called = "";
 
-  let callerPhoneLocal = ""; // normalized 05xxxxxxxx
+  let callerPhoneLocal = "";
   let state = STATES.ASK_TRACK;
 
   let openAiReady = false;
@@ -276,12 +252,13 @@ wss.on("connection", (twilioWs) => {
   let botSpeaking = false;
   let noListenUntilTs = 0;
 
-  // buffer audio until streamSid exists (prevents opening cut)
+  // buffer audio until streamSid exists
   const outAudioBuffer = [];
   const MAX_AUDIO_BUFFER = 500;
 
-  // response queue to avoid overlapping responses
+  // response queue
   let responseInFlight = false;
+  let responseInFlightTimer = null;
   const responseQueue = [];
 
   const lead = {
@@ -305,6 +282,26 @@ wss.on("connection", (twilioWs) => {
     ilog(`[STATE] ${state}${note ? " | " + note : ""}`);
   }
 
+  function clearInFlight() {
+    responseInFlight = false;
+    if (responseInFlightTimer) {
+      clearTimeout(responseInFlightTimer);
+      responseInFlightTimer = null;
+    }
+  }
+
+  function markInFlight() {
+    responseInFlight = true;
+    if (responseInFlightTimer) clearTimeout(responseInFlightTimer);
+
+    // Failsafe: never let the queue get stuck
+    responseInFlightTimer = setTimeout(() => {
+      elog("Queue failsafe: releasing in-flight response (timeout)");
+      clearInFlight();
+      pumpQueue();
+    }, 12000);
+  }
+
   function enqueueTextPrompt(text, why = "") {
     responseQueue.push({ text, why });
     pumpQueue();
@@ -317,7 +314,7 @@ wss.on("connection", (twilioWs) => {
     if (responseQueue.length === 0) return;
 
     const { text, why } = responseQueue.shift();
-    responseInFlight = true;
+    markInFlight();
     dlog("QUEUE SEND", why, text);
 
     openAiWs.send(
@@ -332,79 +329,11 @@ wss.on("connection", (twilioWs) => {
   function speakOneSentenceExact(heText, why) {
     const line = String(heText || "").trim();
     if (!line) return;
-    // instruct the model to read EXACTLY, with niqqud preference, plural-only
     enqueueTextPrompt(
       `הקריאו בדיוק את המשפט הבא בעברית, בלשון רבים בלבד, כגבר (מוטי), ועדיפות לניקוד מלא. בלי להוסיף שום דבר: "${line}"`,
       why
     );
     ilogBot(line);
-  }
-
-  function answerQuestionThenResume(userText) {
-    const off = getStr("offscript", "אני מערכת רישום בלבד. נציג יחזור אליכם עם כל ההסברים.");
-    // Try to answer if answer exists in system/knowledge; else fallback to generic offscript
-    enqueueTextPrompt(
-      `השואל אמר: "${userText}". אם יש תשובה ברורה מתוך ההנחיות/הידע שקיים אצלכם – ענו בקצרה במשפט אחד. אם אין תשובה ודאית – ענו בדיוק: "${off}". לאחר מכן אל תשאלו שאלות חדשות, וחזרו לתסריט.`,
-      "qa_or_fallback"
-    );
-    // then repeat current scripted question
-    askCurrent();
-  }
-
-  async function deliver(callStatusHe, callStatusCode, reason) {
-    if (leadSent) return;
-    leadSent = true;
-
-    lead.timestamp = lead.timestamp || nowIso();
-
-    const payload = {
-      first_name: lead.first_name || "",
-      last_name: lead.last_name || "",
-      phone_number: lead.phone_number || "", // chosen/confirmed phone
-      study_track: lead.study_track || "",
-      source: lead.source || "Voice AI - Nice Line",
-      timestamp: lead.timestamp,
-
-      // always include caller id
-      caller_id: lead.caller_id || caller || "",
-      called: lead.called || called || "",
-      callSid: callSid || "",
-      streamSid: streamSid || "",
-
-      // statuses
-      call_status: callStatusHe, // "שיחה מלאה" / "שיחה חלקית"
-      call_status_code: callStatusCode, // "completed" / "partial"
-      reason: reason || "",
-
-      // debug-friendly remarks
-      remarks: `מסלול: ${lead.study_track || ""} | סטטוס: ${callStatusHe} | caller: ${lead.caller_id || caller || ""} | callSid: ${callSid || ""}`,
-    };
-
-    ilog("CRM> sending", safePayload(payload));
-    const r = await sendToMake(payload);
-    ilog("CRM> result", r);
-    if (!r.ok) elog("CRM> FAILED", r);
-  }
-
-  async function finish(callStatusHe, callStatusCode, reason) {
-    if (callEnded) return;
-    callEnded = true;
-
-    await deliver(callStatusHe, callStatusCode, reason);
-
-    const closing = getStr("closing", "");
-    if (closing) {
-      speakOneSentenceExact(closing, "closing");
-    }
-
-    setTimeout(() => {
-      try {
-        openAiWs?.close();
-      } catch {}
-      try {
-        twilioWs?.close();
-      } catch {}
-    }, graceMs());
   }
 
   function sayThanks() {
@@ -431,6 +360,66 @@ wss.on("connection", (twilioWs) => {
 
     if (!q) return;
     speakOneSentenceExact(q, `ask_${state}`);
+  }
+
+  function answerQuestionThenResume(userText) {
+    const off = getStr("offscript", "אני מערכת רישום בלבד. נציג יחזור אליכם עם כל ההסברים.");
+    enqueueTextPrompt(
+      `השואל אמר: "${userText}". אם יש תשובה ברורה מתוך ההנחיות/הידע שקיים אצלכם – ענו בקצרה במשפט אחד. אם אין תשובה ודאית – ענו בדיוק: "${off}". לאחר מכן חזרו לתסריט.`,
+      "qa_or_fallback"
+    );
+    askCurrent();
+  }
+
+  async function deliver(callStatusHe, callStatusCode, reason) {
+    if (leadSent) return;
+    leadSent = true;
+
+    lead.timestamp = lead.timestamp || nowIso();
+
+    const payload = {
+      first_name: lead.first_name || "",
+      last_name: lead.last_name || "",
+      phone_number: lead.phone_number || "",
+      study_track: lead.study_track || "",
+      source: lead.source || "Voice AI - Nice Line",
+      timestamp: lead.timestamp,
+
+      caller_id: lead.caller_id || caller || "",
+      called: lead.called || called || "",
+      callSid: callSid || "",
+      streamSid: streamSid || "",
+
+      call_status: callStatusHe,
+      call_status_code: callStatusCode,
+      reason: reason || "",
+
+      remarks: `מסלול: ${lead.study_track || ""} | סטטוס: ${callStatusHe} | caller: ${lead.caller_id || caller || ""} | callSid: ${callSid || ""}`,
+    };
+
+    ilog("CRM> sending", safePayload(payload));
+    const r = await sendToMake(payload);
+    ilog("CRM> result", r);
+    if (!r.ok) elog("CRM> FAILED", r);
+  }
+
+  async function finish(callStatusHe, callStatusCode, reason) {
+    if (callEnded) return;
+    callEnded = true;
+
+    await deliver(callStatusHe, callStatusCode, reason);
+
+    const closing = getStr("closing", "");
+    if (closing) speakOneSentenceExact(closing, "closing");
+
+    setTimeout(() => {
+      try {
+        openAiWs?.close();
+      } catch {}
+      try {
+        twilioWs?.close();
+      } catch {}
+    }, graceMs());
   }
 
   /* ------------------------- OpenAI Realtime WS ------------------------- */
@@ -494,14 +483,18 @@ wss.on("connection", (twilioWs) => {
       twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
       return;
     }
+
+    // IMPORTANT: release queue on audio done too
     if (msg.type === "response.audio.done") {
       botSpeaking = false;
+      clearInFlight();
+      pumpQueue();
       return;
     }
 
-    // response lifecycle
-    if (msg.type === "response.completed") {
-      responseInFlight = false;
+    // release on these too (different accounts/models emit different events)
+    if (msg.type === "response.completed" || msg.type === "response.done") {
+      clearInFlight();
       pumpQueue();
       return;
     }
@@ -513,13 +506,11 @@ wss.on("connection", (twilioWs) => {
 
       ilogUser(userText);
 
-      // Q/A handling (answer if possible, else generic) then resume script
       if (isOffScriptQuestion(userText)) {
         answerQuestionThenResume(userText);
         return;
       }
 
-      // FLOW
       if (state === STATES.ASK_TRACK) {
         const tr = normalizeStudyTrack(userText);
         if (!tr) {
@@ -555,17 +546,14 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (state === STATES.ASK_PHONE_CONFIRM) {
-        // If caller id exists, accept "yes" to use it. Or accept digits for new phone.
         const proposed = callerPhoneLocal || normalizeIsraeliPhone("", caller) || "";
 
-        // user says yes
         if (proposed && isYes(userText)) {
           lead.phone_number = proposed;
           await finish("שיחה מלאה", "completed", "done_confirmed_caller");
           return;
         }
 
-        // user provides digits
         const phone = normalizeIsraeliPhone(userText, "");
         if (phone) {
           lead.phone_number = phone;
@@ -573,7 +561,6 @@ wss.on("connection", (twilioWs) => {
           return;
         }
 
-        // user says no / doesn't want caller id -> ask manual once
         if (isNo(userText)) {
           state = STATES.ASK_PHONE_MANUAL;
           logState("to_manual");
@@ -581,7 +568,6 @@ wss.on("connection", (twilioWs) => {
           return;
         }
 
-        // unclear: retry once with phone_retry, then move to manual
         if (!lead.__phone_retry) {
           lead.__phone_retry = true;
           const retry = getStr("questions.phone_retry", "");
@@ -612,7 +598,6 @@ wss.on("connection", (twilioWs) => {
           return;
         }
 
-        // partial end
         await finish("שיחה חלקית", "partial", "invalid_phone_twice");
         return;
       }
@@ -620,7 +605,7 @@ wss.on("connection", (twilioWs) => {
 
     if (msg.type === "error") {
       elog("OpenAI error", msg);
-      responseInFlight = false;
+      clearInFlight();
       pumpQueue();
     }
   });
@@ -697,7 +682,6 @@ wss.on("connection", (twilioWs) => {
 
       ilog("CALL start", { streamSid, callSid, caller, called, callerPhoneLocal });
 
-      // flush buffered audio once streamSid exists
       if (streamSid && outAudioBuffer.length) {
         for (const b64 of outAudioBuffer.splice(0, outAudioBuffer.length)) {
           twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
