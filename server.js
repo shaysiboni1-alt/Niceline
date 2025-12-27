@@ -3,11 +3,16 @@
 // NiceLine / מרכז מל"מ – Voice AI "מוטי" (תסריט חדש)
 // Twilio Media Streams <-> OpenAI Realtime API (WS) on Render
 //
-// FIX 1: תמיכה בשני סוגי אירועי אודיו מה-Realtime:
-//   - response.audio.delta
-//   - response.output_audio.delta
+// FIX A (קריטי): לא לסגור את OpenAI WS לפני שסיימנו להשמיע את הסגירה.
+//    -> מחכים ל-response.done + שהspeechQueue התרוקן, ורק אז שולחים FINAL ומנתקים.
 //
-// FIX 2: לא לקבל "הלו/שלום/כן/לא" כשם — לשאול שוב פעם אחת.
+// FIX B: תמיכה בשני שמות אירועי אודיו:
+//    - response.audio.delta
+//    - response.output_audio.delta
+//
+// FIX C: לא לקבל "הלו/שלום/כן/לא" כשם — שאלה חוזרת אחת.
+//
+// FIX D: בשלב זה ללא ניקוד — מסירים ניקוד מכל טקסט שהבוט מקריא (כולל ENV).
 //
 // נשמרים שמות ENV הקיימים בלבד.
 
@@ -117,6 +122,11 @@ function looksLikePhone(s) {
   return d.length >= 7;
 }
 
+function stripNikud(text) {
+  // Hebrew diacritics range (nikud + cantillation): \u0591-\u05C7
+  return (text || "").toString().replace(/[\u0591-\u05C7]/g, "");
+}
+
 async function postJson(url, payload) {
   if (!url) return { ok: false, reason: "webhook_not_configured" };
   try {
@@ -172,7 +182,11 @@ function getCall(callSid) {
 }
 
 function computeStatus(lead, consent) {
-  const ok = consent === "yes" && !!safeStr(lead.first_name) && !!safeStr(lead.phone_number) && isValidILPhone(lead.phone_number);
+  const ok =
+    consent === "yes" &&
+    !!safeStr(lead.first_name) &&
+    !!safeStr(lead.phone_number) &&
+    isValidILPhone(lead.phone_number);
   return ok ? { code: "completed", label: "שיחה מלאה" } : { code: "partial", label: "שיחה חלקית" };
 }
 
@@ -406,10 +420,19 @@ wss.on("connection", (twilioWs) => {
   let responseActive = false;
   const speechQueue = [];
 
+  // pending end-of-call behavior
+  let endRequested = false;
+  let endReason = "";
+  let endAfterMs = 0;
+
   function tryDequeueSpeech() {
     if (!openaiReady) return;
     if (responseActive) return;
-    if (speechQueue.length === 0) return;
+    if (speechQueue.length === 0) {
+      // אם אין יותר מה להגיד וביקשנו לסיים – עכשיו הזמן לסיים
+      if (endRequested) finalizeAndHangup(endReason).catch(() => {});
+      return;
+    }
 
     const nextText = speechQueue.shift();
     responseActive = true;
@@ -417,7 +440,7 @@ wss.on("connection", (twilioWs) => {
   }
 
   function sayQueue(text) {
-    const t = safeStr(text);
+    const t = safeStr(stripNikud(text)); // ✅ בלי ניקוד
     if (!t) return;
     botLog(t);
     speechQueue.push(t);
@@ -489,9 +512,9 @@ wss.on("connection", (twilioWs) => {
     );
   }
 
+  // ✅ במקום לסגור WS מיד, מבקשים סיום ומחכים שהאודיו יסתיים
   async function finishCall(reason) {
     if (!callSid) return;
-
     if (state !== STATES.DONE) {
       state = STATES.DONE;
       const closing =
@@ -500,21 +523,31 @@ wss.on("connection", (twilioWs) => {
       sayQueue(closing);
     }
 
+    endRequested = true;
+    endReason = reason || "completed_flow";
+    endAfterMs = ENV.MB_HANGUP_GRACE_MS;
+
+    // אם אין כרגע דיבור פעיל ואין עוד תור – נסיים מיד
+    tryDequeueSpeech();
+  }
+
+  async function finalizeAndHangup(reason) {
+    if (!callSid) return;
     const c = getCall(callSid);
-    if (c.finalTimer) clearTimeout(c.finalTimer);
+
+    // למנוע כפילות
+    if (c.finalTimer) return;
 
     c.finalTimer = setTimeout(async () => {
-      await sendFinal(callSid, reason);
-      const h = await hangupCall(callSid);
-      dbg("Hangup result", h);
-    }, ENV.MB_HANGUP_GRACE_MS);
-
-    try {
-      openaiWs.close();
-    } catch {}
-    try {
-      twilioWs.close();
-    } catch {}
+      await sendFinal(callSid, reason || "call_end");
+      await hangupCall(callSid);
+      try {
+        openaiWs.close();
+      } catch {}
+      try {
+        twilioWs.close();
+      } catch {}
+    }, Math.max(1000, endAfterMs || ENV.MB_HANGUP_GRACE_MS));
   }
 
   // ----- Name validation -----
@@ -522,9 +555,7 @@ wss.on("connection", (twilioWs) => {
   function isTrashName(name) {
     const t = normalizeText(name);
     if (!t) return true;
-    // אם הוא רק מילה אחת והיא trash -> לא שם
     if (NAME_TRASH.has(t)) return true;
-    // אם הוא קצר מדי ורק "ה" וכו'
     if (t.length < 2) return true;
     return false;
   }
@@ -601,7 +632,6 @@ wss.on("connection", (twilioWs) => {
       const ok = saveNameToLead(userText);
       if (!ok) {
         if (retries.name >= 1) {
-          // אין שם -> ממשיכים לטלפון בכל זאת
           state = callerPhoneLocal ? STATES.CONFIRM_CALLER_LAST4 : STATES.ASK_PHONE;
           logInfo("[STATE] ASK_NAME -> (no name) ->", state);
           askCurrentQuestionQueued();
@@ -742,7 +772,7 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // ✅ FIX: handle BOTH audio delta event names
+    // audio out -> Twilio (support both event names)
     const isAudioDelta =
       (msg.type === "response.audio.delta" || msg.type === "response.output_audio.delta") && msg.delta && streamSid;
 
@@ -751,12 +781,16 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
+    // response finished -> release lock + next in queue (or finalize if endRequested)
     if (msg.type === "response.done") {
       responseActive = false;
-      setTimeout(() => tryDequeueSpeech(), Math.max(0, ENV.MB_NO_BARGE_TAIL_MS || 0));
+      setTimeout(() => {
+        tryDequeueSpeech();
+      }, Math.max(0, ENV.MB_NO_BARGE_TAIL_MS || 0));
       return;
     }
 
+    // User transcription
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (msg.transcript || "").trim();
       if (!transcript) return;
@@ -810,9 +844,11 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
+      // אם Twilio לא ניגן פתיח — ננגן פתיח מה-ENV (ללא ניקוד)
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
         sayQueue(ENV.MB_OPENING_TEXT);
       }
+
       return;
     }
 
@@ -825,16 +861,14 @@ wss.on("connection", (twilioWs) => {
 
     if (data.event === "stop") {
       logInfo("Twilio stop", { streamSid, callSid });
-
       const c = getCall(callSid);
       c.endedAt = nowIso();
-
       clearTimers();
 
-      if (c.finalTimer) clearTimeout(c.finalTimer);
-      c.finalTimer = setTimeout(() => {
-        sendFinal(callSid, "twilio_stop").catch(() => {});
-      }, Math.max(1000, ENV.MB_HANGUP_GRACE_MS));
+      // אם Twilio סגר לבד לפני שסיימנו – שולחים FINAL בכל מקרה
+      if (!c.finalSent) {
+        await sendFinal(callSid, "twilio_stop");
+      }
 
       try {
         openaiWs.close();
@@ -843,15 +877,12 @@ wss.on("connection", (twilioWs) => {
     }
   });
 
-  twilioWs.on("close", () => {
+  twilioWs.on("close", async () => {
     clearTimers();
     if (callSid) {
       const c = getCall(callSid);
       if (!c.finalSent) {
-        if (c.finalTimer) clearTimeout(c.finalTimer);
-        c.finalTimer = setTimeout(() => {
-          sendFinal(callSid, "ws_close").catch(() => {});
-        }, 1500);
+        await sendFinal(callSid, "ws_close");
       }
     }
     try {
