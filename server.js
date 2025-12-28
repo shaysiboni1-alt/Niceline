@@ -8,6 +8,9 @@
 // B) לא לפרש "אמרתי כן/עניתי כן/אמר ... כן" כשם.
 // C) ב-CONFIRM_CALLER_LAST4: אם יש "כן, אבל תכתוב את השם" -> לא לסיים; לעבור לתיקון שם ואז לסיים.
 //
+// שינוי נוסף לפי בקשתך (כירורגי בלבד):
+// D) MB_SPEECH_SPEED ברירת־מחדל = 1.0 (במקום 0.95)
+//
 // כל היתר נשמר כפי שהיה.
 
 const express = require("express");
@@ -43,7 +46,9 @@ const ENV = {
   MB_MAX_WARN_BEFORE_MS: Number(process.env.MB_MAX_WARN_BEFORE_MS || "30000"),
   MB_NO_BARGE_TAIL_MS: Number(process.env.MB_NO_BARGE_TAIL_MS || "1600"),
 
-  MB_SPEECH_SPEED: Number(process.env.MB_SPEECH_SPEED || "0.95"),
+  // D) default speed back to 1.0
+  MB_SPEECH_SPEED: Number(process.env.MB_SPEECH_SPEED || "1.0"),
+
   MB_STT_LANGUAGE: process.env.MB_STT_LANGUAGE || "he",
 
   MB_VAD_PREFIX_MS: Number(process.env.MB_VAD_PREFIX_MS || "200"),
@@ -834,7 +839,6 @@ wss.on("connection", (twilioWs) => {
 
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const yn = detectYesNo(userText);
-      const t = normalizeText(userText);
 
       // (C) אם אמרו "כן" אבל גם מבקשים תיקון שם — לעבור לתיקון שם, לא לסיים
       if (yn === "yes" && wantsNameCorrection(userText)) {
