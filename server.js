@@ -4,7 +4,10 @@
 // Twilio Media Streams <-> OpenAI Realtime API (WS) on Render
 //
 // ✅ MODE: "HARD SCRIPT" (אנטי-קטיעות/רעשים)
-// ✅ ADDED: Full assistant output logging (so we see EXACTLY what the bot actually says)
+// - אין שאלת הסכמה אחרי הפתיח.
+// - תסריט קשיח: ASK_NAME -> CONFIRM_NAME -> CONFIRM_CALLER_LAST4 (או ASK_PHONE) -> DONE
+// - בסטייטים של אישור: רק כן/לא. כל דבר אחר = חזרה קצרה על השאלה.
+// - אם STT מזייף/רעש/קטיעה: לא עונים על "מחיר/מסלולים" וכו' — חוזרים לתסריט.
 //
 // ⚠️ ENV names unchanged. Webhook payload unchanged.
 
@@ -249,6 +252,7 @@ function isGarbageTranscript(text) {
 }
 
 function isUnreliableYesNo(text) {
+  // כשמצפים "כן/לא" — אם הגיע משפט ארוך/מורכב זה כמעט תמיד STT מזויף/קטיעה
   const t = normalizeText(text);
   if (!t) return true;
   const tokens = t.split(" ").filter(Boolean);
@@ -659,41 +663,6 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_LOG_BOT) logInfo("BOT>", text);
   }
 
-  // ✅ NEW: capture actual assistant output text (what model really produced)
-  let currentExpectedText = "";
-  let currentActualText = "";
-  let currentResponseId = "";
-  let seenAnyActualText = false;
-
-  function resetAssistantCapture(expected) {
-    currentExpectedText = safeStr(expected);
-    currentActualText = "";
-    currentResponseId = "";
-    seenAnyActualText = false;
-  }
-
-  function appendAssistantTextDelta(delta) {
-    if (!delta) return;
-    seenAnyActualText = true;
-    currentActualText += delta;
-  }
-
-  function logAssistantActualOnDone() {
-    const expected = safeStr(currentExpectedText);
-    const actual = safeStr(currentActualText);
-
-    if (seenAnyActualText) {
-      logInfo("[ASSISTANT_ACTUAL_TEXT]", actual);
-      if (expected && actual && expected !== actual) {
-        logInfo("[ASSISTANT_EXPECTED_TEXT]", expected);
-        logInfo("[ASSISTANT_MISMATCH]", {
-          responseId: currentResponseId || "",
-          note: "המודל לא הקריא מילה-במילה. זה מסביר סטיות (למשל 'מסלולי לימוד').",
-        });
-      }
-    }
-  }
-
   // ---------- Speech queue ----------
   let responseActive = false;
   const speechQueue = [];
@@ -713,35 +682,58 @@ wss.on("connection", (twilioWs) => {
 
     const nextText = speechQueue.shift();
     responseActive = true;
-
-    // ✅ NEW: expected vs actual capture starts here
-    resetAssistantCapture(nextText);
-
     createResponse(nextText);
   }
 
   function sayQueue(text) {
     const t = safeStr(text);
     if (!t) return;
-    botLog(t); // what we ASKED to say
+    botLog(t);
     speechQueue.push(t);
     tryDequeueSpeech();
   }
 
   function createResponse(text) {
+    // We do NOT want the model to "compose" anything.
+    // We want it to READ / speak the exact script.
+    // To make that enforceable + loggable, we:
+    // 1) Create a conversation item containing the exact text to read.
+    // 2) Create a response with BOTH audio + text modalities.
+    //
+    // This makes the server emit output_text deltas + response.done text,
+    // so we can log EXACTLY what the model produced.
+    sendOpenAI({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              "הַקְרֵא/י אֶת הַטֶּקְסְט הַבָּא בְּדִיּוּק מִלָּה-בְּמִלָּה, בְּעִבְרִית וּבִלְשׁוֹן רַבִּים. " +
+              "לֹא לְהוֹסִיף, לֹא לְשַׁנּוֹת, וְלֹא לְהַסְבִּיר שׁוּם דָּבָר.\n\n" +
+              text,
+          },
+        ],
+      },
+    });
+
     sendOpenAI({
       type: "response.create",
       response: {
+        // request BOTH so we can log output text + stream audio
+        output_modalities: ["audio", "text"],
         instructions:
           `דברו בעברית תקינה, בלשון רבים בלבד.\n` +
           `טון אנושי, חברי וחם (לא רשמי מדי), קצר וברור.\n` +
           `קצב דיבור מהיר יחסית אבל ברור (סביב ${EFFECTIVE_SPEECH_SPEED}).\n` +
           `אם מקריאים מספרים/ספרות – להקריא ספרה-ספרה.\n` +
-          `חשוב מאוד: לקרוא מילה-במילה, בלי להוסיף מידע, בלי להסביר, בלי לאלתר.\n\n` +
-          `הטקסט להקראה (להגיד בדיוק):\n${text}`,
+          `חובה לקרוא מילה-במילה את הטקסט שנמסר. בלי תוספות. בלי אילתור.\n`,
       },
     });
   }
+
 
   function askCurrentQuestionQueued() {
     if (state === STATES.ASK_NAME) {
@@ -838,14 +830,17 @@ wss.on("connection", (twilioWs) => {
   }
 
   function hardYesNoGate(userText) {
+    // בסטייטים של אישור: אם לא כן/לא ברור — לא עושים שום דבר אחר.
     if (state === STATES.CONFIRM_NAME || state === STATES.CONFIRM_CALLER_LAST4 || state === STATES.CONFIRM_PHONE) {
       const yn = detectYesNo(userText);
       if (yn) return { ok: true, yn };
+      // אם זה ארוך/מוזר => מבקשים שוב קצר
       if (isUnreliableYesNo(userText)) {
         sayQueue("לא שמעתי טוב. כן או לא?");
       } else {
         sayQueue("כן או לא?");
       }
+      // חוזרים על אותה שאלה
       askCurrentQuestionQueued();
       return { ok: false, yn: null };
     }
@@ -865,24 +860,30 @@ wss.on("connection", (twilioWs) => {
 
     armIdleTimers();
 
+    // סירוב ברור בכל שלב -> סוגרים יפה (זה כן חלק מהתסריט)
     if (isRefusal(userText)) {
       sayQueue("בסדר. תודה רבה ויום נעים.");
       finishCall("user_refused", { skipClosing: true }).catch(() => {});
       return;
     }
 
+    // HARD gate לסטייטים של אישור
     const gate = hardYesNoGate(userText);
     if (!gate.ok) return;
 
+    // אם המשתמש שואל פרטים/מחיר וכו' — לא עונים, רק חוזרים לתסריט (קצר)
     if (looksLikeQuestionOrDetails(userText)) {
       if (state === STATES.ASK_NAME || state === STATES.ASK_NAME_CORRECT) {
         sayQueue("רק לרישום קצר.");
         askCurrentQuestionQueued();
         return;
       }
+      // אם הוא שאל בזמן אישור — ה-gate כבר טיפל בזה
     }
 
+    // -------- FLOW --------
     if (state === STATES.ASK_NAME) {
+      // אם אמר "כן/בסדר" אחרי פתיח — זה לא שם. חוזרים לשאלה.
       const yn = detectYesNo(userText);
       if (yn === "yes") {
         askCurrentQuestionQueued();
@@ -891,6 +892,7 @@ wss.on("connection", (twilioWs) => {
 
       const t = normalizeText(userText);
       const tokens = t.split(" ").filter(Boolean);
+      // משפט ארוך מדי = חשוד (קטיעה/רעש)
       if (tokens.length > 6 || t.length > 45) {
         sayQueue("לא שמעתי טוב.");
         askCurrentQuestionQueued();
@@ -910,6 +912,7 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
+      // חייבים וידוא שם תמיד
       pendingName = nameObj;
       state = STATES.CONFIRM_NAME;
       logInfo("[STATE] ASK_NAME -> CONFIRM_NAME", pendingName);
@@ -935,6 +938,7 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
+      // לא אמור להגיע לכאן בגלל gate
       askCurrentQuestionQueued();
       return;
     }
@@ -975,7 +979,9 @@ wss.on("connection", (twilioWs) => {
         c.lead.phone_number = callerPhoneLocal;
         logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (use caller)", { phone_number: callerPhoneLocal });
 
+        // אישור קצר כדי שהלקוח ישמע שזה נקלט
         sayQueue("רשמתי.");
+
         finishCall("completed_flow").catch(() => {});
         return;
       }
@@ -987,6 +993,7 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
+      // לא אמור להגיע לכאן בגלל gate
       askCurrentQuestionQueued();
       return;
     }
@@ -1021,6 +1028,7 @@ wss.on("connection", (twilioWs) => {
         logInfo("[STATE] CONFIRM_PHONE -> DONE", { phone_number: pendingPhone });
 
         sayQueue("רשמתי.");
+
         finishCall("completed_flow").catch(() => {});
         return;
       }
@@ -1032,11 +1040,13 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
+      // לא אמור להגיע לכאן בגלל gate
       askCurrentQuestionQueued();
       return;
     }
   }
 
+  // -------------------- OpenAI WS events --------------------
   openaiWs.on("open", () => {
     openaiReady = true;
     gotOpenAI = true;
@@ -1091,26 +1101,7 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // ✅ NEW: capture assistant text output (delta)
-    if (msg.type === "response.text.delta" && typeof msg.delta === "string") {
-      appendAssistantTextDelta(msg.delta);
-      return;
-    }
-    if (msg.type === "response.output_text.delta" && typeof msg.delta === "string") {
-      appendAssistantTextDelta(msg.delta);
-      return;
-    }
-
-    // ✅ NEW: sometimes the API sends the response id in created event
-    if (msg.type === "response.created" && msg.response?.id) {
-      currentResponseId = String(msg.response.id);
-      return;
-    }
-
     if (msg.type === "response.done") {
-      // log what the model actually produced (text)
-      logAssistantActualOnDone();
-
       responseActive = false;
       setTimeout(() => {
         tryDequeueSpeech();
@@ -1174,6 +1165,7 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
+      // אם אין MP3 — אפשר לפתוח ב-MB_OPENING_TEXT. אם יש MP3 בטוויליו — מתחילים מיד.
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
         sayQueue(ENV.MB_OPENING_TEXT);
         setTimeout(() => {
