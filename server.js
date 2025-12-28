@@ -3,10 +3,11 @@
 // NiceLine / מרכז מל"מ – Voice AI (מוטי) – תסריט רישום
 // Twilio Media Streams <-> OpenAI Realtime API (WS) on Render
 //
-// CHANGES (כירורגי בלבד לטיפול בבאג הלוג):
-// A) אם opening_played=1 (הפתיח של Twilio כבר שאל "זה בסדר?") -> לשאול שם מיידית (לא להמתין).
-// B) לא לפרש "אמרתי כן/עניתי כן/אמר ... כן" כשם.
-// C) ב-CONFIRM_CALLER_LAST4: אם יש "כן, אבל תכתוב את השם" -> לא לסיים; לעבור לתיקון שם ואז לסיים.
+// CHANGES (כירורגי בלבד):
+// 1) בסירוב ("לא רוצה") — לא לנגן MB_CLOSING_TEXT (שכולל "נציג יחזור").
+// 2) להוסיף ביטויי היימיש אנושיים בתוך הטקסטים הקבועים (במינון עדין).
+// 3) לנקות סימני פיסוק מהשם (למשל "סיבוני.").
+// 4) למנוע "מה?" מלהיחשב שם.
 //
 // כל היתר נשמר כפי שהיה.
 
@@ -136,7 +137,6 @@ function isOpeningYesPhrase(text) {
   if (!t) return false;
   const hasYes = t.includes("כן") || t === "ok" || t === "okay";
   const hasSaid = t.includes("אמרתי") || t.includes("עניתי") || t.includes("אמר") || t.includes("אמרתי לכם") || t.includes("אמרתי כן");
-  // דוגמאות שראינו: "אמר בי כן" (טעות STT) — נתפוס גם "אמר" + "כן"
   return hasYes && (hasSaid || t.startsWith("אמר") || t.includes("אמר ") || t.includes("אמרתי "));
 }
 
@@ -508,10 +508,8 @@ wss.on("connection", (twilioWs) => {
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
 
-  // (C) אם אישרו מספר ואז ביקשו לתקן שם, נסמן שהטלפון כבר סגור
   let phoneConfirmedFromCaller = false;
 
-  // (A) מנגנון "תשאל שם מיד" אם הפתיח כבר התנגן
   let pendingImmediateAskName = false;
   let askedNameOnce = false;
 
@@ -527,7 +525,7 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_IDLE_WARNING_MS > 0) {
       if (idleWarnTimer) clearTimeout(idleWarnTimer);
       idleWarnTimer = setTimeout(() => {
-        sayQueue("רק לוודא שאתם איתנו. אשמח שתענו בבקשה.");
+        sayQueue("רַק לְוַדֵּא שֶׁאַתֶּם אִתָּנוּ, בְּעֶזְרַת הַשֵּׁם. אֶשְׂמַח שֶׁתַּעֲנוּ בְּבַקָּשָׁה.");
         askCurrentQuestionQueued();
       }, ENV.MB_IDLE_WARNING_MS);
     }
@@ -543,7 +541,7 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_MAX_CALL_MS > 0 && ENV.MB_MAX_WARN_BEFORE_MS > 0) {
       const warnAt = Math.max(0, ENV.MB_MAX_CALL_MS - ENV.MB_MAX_WARN_BEFORE_MS);
       maxCallWarnTimer = setTimeout(() => {
-        sayQueue("לפני שנסיים, אשמח רק להשלים את הפרטים כדי שיועץ יחזור אליכם.");
+        sayQueue("לִפְנֵי שֶׁנְּסַיֵּם, בְּעֶזְרַת הַשֵּׁם—אֶשְׂמַח רַק לְהַשְׁלִים אֶת הַפְּרָטִים כְּדֵי שֶׁיַּחֲזְרוּ אֲלֵיכֶם.");
         askCurrentQuestionQueued();
       }, warnAt);
     }
@@ -618,7 +616,7 @@ wss.on("connection", (twilioWs) => {
       response: {
         instructions:
           `דברו בעברית תקינה, בלשון רבים בלבד.\n` +
-          `טון חם, אנושי, נעים ומרגיע, עם אינטונציה טבעית (לא רובוטי) וחיוך עדין.\n` +
+          `טון חם, אנושי, נעים ומרגיע, עם אינטונציה טבעית וחיוך עדין.\n` +
           `קצב מעט יותר מהרגיל (סביב ${ENV.MB_SPEECH_SPEED}).\n` +
           `כשמקריאים מספרים/ספרות – להקריא ספרה-ספרה בצורה ברורה (למשל "0 5 0 ...").\n\n` +
           `הטקסט להקראה (להגיד בדיוק):\n${text}`,
@@ -629,22 +627,22 @@ wss.on("connection", (twilioWs) => {
   function askCurrentQuestionQueued() {
     if (state === STATES.ASK_NAME) {
       askedNameOnce = true;
-      sayQueue("מצוין. איך קוראים לכם? אפשר שם פרטי ושם משפחה.");
+      sayQueue("מָצוּיָן, בְּעֶזְרַת הַשֵּׁם—אֵיךְ קוֹרְאִים לָכֶם? אֶפְשָׁר שֵׁם פְּרָטִי וְשֵׁם מִשְׁפָּחָה.");
       return;
     }
     if (state === STATES.CONFIRM_NAME) {
       const full = [pendingName.first, pendingName.last].filter(Boolean).join(" ");
-      sayQueue(`רשמתי את השם: ${full}. זה נכון?`);
+      sayQueue(`תִּבָּרְכוּ, רָשַׁמְתִּי אֶת הַשֵּׁם: ${full}. זֶה נָכוֹן?`);
       return;
     }
     if (state === STATES.ASK_NAME_CORRECT) {
-      sayQueue("מעולה, איך נכון לרשום את השם? אפשר לומר שוב שם פרטי ושם משפחה.");
+      sayQueue("בְּכֵיף. אֵיךְ נָכוֹן לִרְשׁוֹם אֶת הַשֵּׁם? אֶפְשָׁר לוֹמַר שׁוּב שֵׁם פְּרָטִי וְשֵׁם מִשְׁפָּחָה.");
       return;
     }
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const last4 = last4Digits(callerPhoneLocal);
       if (last4) {
-        sayQueue(`אני רואה שהשיחה הגיעה ממספר שמסתיים ב-${digitsSpaced(last4)}. זה המספר הנכון לחזור אליכם?`);
+        sayQueue(`בָּרוּךְ הַשֵּׁם, אֲנִי רוֹאֶה שֶׁהַשִּׂיחָה הִגִּיעָה מִמִּסְפָּר שֶׁמִּסְתַּיֵּם בְּ-${digitsSpaced(last4)}. זֶה הַמִּסְפָּר הַנָּכוֹן לַחֲזֹר אֲלֵיכֶם?`);
       } else {
         state = STATES.ASK_PHONE;
         askCurrentQuestionQueued();
@@ -652,17 +650,19 @@ wss.on("connection", (twilioWs) => {
       return;
     }
     if (state === STATES.ASK_PHONE) {
-      sayQueue("אשמח אם תגידו לי את מספר הטלפון המלא לחזרה. אנא אמרו ספרה-ספרה, רק מספרים.");
+      sayQueue("אֶשְׂמַח אִם תֹּאמְרוּ לִי אֶת מִסְפָּר הַטֶּלֶפוֹן הַמָּלֵא לַחֲזָרָה. אֲנָא אִמְרוּ סִפְרָה-סִפְרָה, רַק מִסְפָּרִים.");
       return;
     }
     if (state === STATES.CONFIRM_PHONE) {
-      sayQueue(`רק לוודא — המספר הוא ${digitsSpaced(pendingPhone)}. נכון?`);
+      sayQueue(`רַק לְוַדֵּא—הַמִּסְפָּר הוּא ${digitsSpaced(pendingPhone)}. נָכוֹן?`);
       return;
     }
   }
 
   // ----- Name parsing -----
-  const NAME_TRASH = new Set(["הלו", "שלום", "היי", "כן", "לא", "אוקיי", "אוקי", "בסדר", "מי זה", "מה זה"]);
+  // הוספנו "מה" כדי שלא ייקלט כשם
+  const NAME_TRASH = new Set(["הלו", "שלום", "היי", "כן", "לא", "אוקיי", "אוקי", "בסדר", "מי זה", "מה זה", "מה"]);
+
   function isTrashName(name) {
     const t = normalizeText(name);
     if (!t) return true;
@@ -671,11 +671,20 @@ wss.on("connection", (twilioWs) => {
     return false;
   }
 
+  // ניקוי פיסוק מהשם (כולל נקודות/סימני שאלה/פסיקים), תוך שמירה על אותיות וניקוד
+  function cleanHebrewName(raw) {
+    return (raw || "")
+      .toString()
+      .replace(/[0-9]/g, " ")
+      .replace(/[^\p{L}\p{M}\s]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function parseName(text) {
-    const raw = safeStr(text).replace(/[0-9]/g, "").replace(/\s+/g, " ").trim();
+    const raw = cleanHebrewName(text);
     if (!raw) return null;
     if (isTrashName(raw)) return null;
-    // (B) הגנה: אם זה בעצם "אמרתי כן" וכד' — לא שם
     if (isOpeningYesPhrase(raw)) return null;
 
     const parts = raw.split(" ").filter(Boolean);
@@ -689,15 +698,20 @@ wss.on("connection", (twilioWs) => {
     c.lead.last_name = nameObj.last || "";
   }
 
-  async function finishCall(reason) {
+  // שינוי: אפשר לסיים שיחה בלי "closing" מלא
+  async function finishCall(reason, opts = {}) {
     if (!callSid) return;
+
+    const skipClosing = !!opts.skipClosing;
 
     if (state !== STATES.DONE) {
       state = STATES.DONE;
-      const closing =
-        ENV.MB_CLOSING_TEXT ||
-        "תודה רבה, הפרטים נשמרו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
-      sayQueue(closing);
+      if (!skipClosing) {
+        const closing =
+          ENV.MB_CLOSING_TEXT ||
+          "תודה רבה, הפרטים נשמרו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
+        sayQueue(closing);
+      }
     }
 
     endRequested = true;
@@ -730,26 +744,27 @@ wss.on("connection", (twilioWs) => {
 
     armIdleTimers();
 
+    // (1) סירוב — סגירה יפה בלי "נציג יחזור" (ולא מנגן MB_CLOSING_TEXT)
     if (isRefusal(userText)) {
       c.meta.consent = "no";
-      sayQueue("בסדר גמור, תודה רבה ויום נעים.");
-      finishCall("user_refused").catch(() => {});
+      sayQueue("בְּסֵדֶר גָּמוּר. תּוֹדָה רַבָּה, תִּבָּרְכוּ, וְיוֹם נָעִים.");
+      finishCall("user_refused", { skipClosing: true }).catch(() => {});
       return;
     }
 
+    // שאלות על פרטים — פה כן לגיטימי להגיד שנציג יחזור
     if (isQuestionAboutDetails(userText)) {
       sayQueue(
-        "זו שאלה חשובה, ויועץ לימודים ישמח להסביר לכם את כל הפרטים בצורה מדויקת ומותאמת אישית. אני כאן רק כדי להעביר את הפניה, והוא יחזור אליכם בהקדם."
+        "זוֹ שְׁאֵלָה חֲשׁוּבָה. אֲנִי מַעֲרֶכֶת רִישּׁוּם בִּלְבַד, וְנָצִיג יַחֲזֹר אֲלֵיכֶם עִם כָּל הַהֶסְבֵּרִים, בְּעֶזְרַת הַשֵּׁם."
       );
       finishCall("asked_details").catch(() => {});
       return;
     }
 
-    // אם המשתמש רק "אישר פתיח" (כולל ניסוחים כמו "אמרתי כן") — לשאול שם מיד.
+    // אם המשתמש רק "אישר פתיח" — לשאול שם מיד.
     if (state === STATES.ASK_NAME) {
       const yn = detectYesNo(userText);
       const t = normalizeText(userText);
-
       if ((yn === "yes" && t.length <= 12) || isOpeningYesPhrase(userText)) {
         askCurrentQuestionQueued();
         return;
@@ -766,7 +781,7 @@ wss.on("connection", (twilioWs) => {
           return;
         }
         retries.name += 1;
-        sayQueue("סליחה, חשוב לי לרשום את השם נכון. תוכלו לומר שם פרטי ושם משפחה?");
+        sayQueue("סְלִיחָה, חָשׁוּב לִי לִרְשׁוֹם נָכוֹן. אֶפְשָׁר שֵׁם פְּרָטִי וְשֵׁם מִשְׁפָּחָה, בְּעֶזְרַת הַשֵּׁם?");
         return;
       }
 
@@ -782,7 +797,6 @@ wss.on("connection", (twilioWs) => {
       if (yn === "yes") {
         saveNameToLead(pendingName);
 
-        // אם כבר אישרו טלפון קודם (בתרחיש תיקון שם אחרי מספר) — סיום
         if (phoneConfirmedFromCaller) {
           logInfo("[STATE] CONFIRM_NAME -> DONE (phone already confirmed)");
           finishCall("completed_flow").catch(() => {});
@@ -815,14 +829,14 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      sayQueue("רק כן או לא בבקשה. זה השם הנכון?");
+      sayQueue("רַק כֵּן אוֹ לֹא, בְּבַקָּשָׁה. זֶה הַשֵּׁם הַנָּכוֹן?");
       return;
     }
 
     if (state === STATES.ASK_NAME_CORRECT) {
       const nameObj = parseName(userText);
       if (!nameObj) {
-        sayQueue("סליחה, לא הצלחתי להבין. תוכלו לומר שוב שם פרטי ושם משפחה?");
+        sayQueue("סְלִיחָה, לֹא הִצְלַחְתִּי לְהָבִין. אֶפְשָׁר לוֹמַר שׁוּב שֵׁם פְּרָטִי וְשֵׁם מִשְׁפָּחָה?");
         return;
       }
       pendingName = nameObj;
@@ -834,17 +848,14 @@ wss.on("connection", (twilioWs) => {
 
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const yn = detectYesNo(userText);
-      const t = normalizeText(userText);
 
-      // (C) אם אמרו "כן" אבל גם מבקשים תיקון שם — לעבור לתיקון שם, לא לסיים
       if (yn === "yes" && wantsNameCorrection(userText)) {
-        // שומרים טלפון caller, אבל לא מסיימים לפני תיקון השם
         c.lead.phone_number = callerPhoneLocal;
         phoneConfirmedFromCaller = true;
 
         state = STATES.ASK_NAME_CORRECT;
         logInfo("[STATE] CONFIRM_CALLER_LAST4 -> ASK_NAME_CORRECT (name correction requested)");
-        sayQueue("בטח. בואו נתקן את השם כדי שיירשם נכון.");
+        sayQueue("בְּכֵיף, תִּבָּרְכוּ. בּוֹאוּ נְתַקֵּן אֶת הַשֵּׁם כְּדֵי שֶׁיֵּרָשֵׁם נָכוֹן.");
         askCurrentQuestionQueued();
         return;
       }
@@ -886,7 +897,7 @@ wss.on("connection", (twilioWs) => {
           return;
         }
         retries.phone += 1;
-        sayQueue("לצורך חזרה אני צריך מספר תקין בין תשע לעשר ספרות. אנא אמרו ספרה-ספרה, רק מספרים.");
+        sayQueue("לְצֹרֶךְ חֲזָרָה אֲנִי צָרִיךְ מִסְפָּר תָּקִין בֵּין תֵּשַׁע לְעֶשֶׂר סְפָרוֹת. אֲנָא אִמְרוּ סִפְרָה-סִפְרָה, רַק מִסְפָּרִים.");
         return;
       }
 
@@ -924,7 +935,7 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      sayQueue("רק כן או לא בבקשה. זה המספר הנכון?");
+      sayQueue("רַק כֵּן אוֹ לֹא, בְּבַקָּשָׁה. זֶה הַמִּסְפָּר הַנָּכוֹן?");
       return;
     }
   }
@@ -969,7 +980,6 @@ wss.on("connection", (twilioWs) => {
       armIdleTimers();
       armMaxCallTimers();
 
-      // (A) אם הפתיח כבר התנגן בטוויליו — תשאל שם מיידית, פעם אחת בלבד
       if (pendingImmediateAskName && !askedNameOnce) {
         askCurrentQuestionQueued();
         pendingImmediateAskName = false;
@@ -1058,7 +1068,6 @@ wss.on("connection", (twilioWs) => {
         sayQueue(ENV.MB_OPENING_TEXT);
       }
 
-      // (A) אם הפתיח כבר התנגן בטוויליו -> ברגע שהמודל מוכן נשאל שם
       if (openingPlayedByTwilio) {
         pendingImmediateAskName = true;
         if (openaiReady && !askedNameOnce) {
