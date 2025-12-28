@@ -13,8 +13,10 @@
 // 7) לא משנים שמות ENV — משתמשים רק בקיימים אצלך.
 //
 // CHANGES NOW (כירורגי בלבד):
-// A) ביטול וובהוק שני: לא שולחים יותר recording_update בכלל (רק lead_final).
-// B) שיפור טון דיבור: יותר אנושי/חם + מעט יותר מהיר (דרך instructions בלבד).
+// 1) ביטול וידוא "הסכמה": לא מנהלים state של ASK_CONSENT, לא שואלים "זה בסדר?"
+//    הפתיח כבר שאל בטוויליו. אם המשתמש מסרב ("לא רוצה/עזוב") בכל שלב -> סגירה.
+// 2) זיכרון אפליקטיבי: שמירת 50 שניות אחרונות של תמלולים (לוגיקה/דיבאג בלבד).
+// 3) חידוד STT לעברית רבנית/היימיש באמצעות prompt לתמלול (ללא שינוי ENV/ארכיטקטורה).
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -119,7 +121,7 @@ function detectYesNo(s) {
 
 function isRefusal(text) {
   const t = normalizeText(text);
-  return t.includes("לא רוצה") || t.includes("עזוב") || t === "ביי" || t.includes("תעזבו") || t.includes("לא מעוניין");
+  return t.includes("לא רוצה") || t.includes("עזוב") || t === "ביי" || t.includes("תעזבו") || t.includes("לא מעוניין") || t === "לא";
 }
 
 function isQuestionAboutDetails(text) {
@@ -338,7 +340,8 @@ function getCall(callSid) {
       recordingSid: "",
       recordingUrl: "",
       lead: { first_name: "", last_name: "", phone_number: "", study_track: "" },
-      meta: { consent: "" },
+      meta: { consent: "assumed" }, // (כירורגי) ביטלנו אימות הסכמה; נשמר כ-assumed בלבד.
+      memory: { transcripts: [] },  // (כירורגי) זיכרון 50 שניות אחרונות
       finalSent: false,
       finalTimer: null,
     });
@@ -346,12 +349,17 @@ function getCall(callSid) {
   return calls.get(callSid);
 }
 
-function computeStatus(lead, consent) {
-  const ok =
-    consent === "yes" &&
-    !!safeStr(lead.first_name) &&
-    !!safeStr(lead.phone_number) &&
-    isValidILPhoneDigits(lead.phone_number);
+function addTranscriptMemory(callSid, text) {
+  const c = getCall(callSid);
+  const now = Date.now();
+  c.memory.transcripts.push({ ts: now, text: safeStr(text) });
+  // keep only last 50 seconds
+  const cutoff = now - 50_000;
+  c.memory.transcripts = c.memory.transcripts.filter((x) => x.ts >= cutoff && x.text);
+}
+
+function computeStatus(lead) {
+  const ok = !!safeStr(lead.first_name) && !!safeStr(lead.phone_number) && isValidILPhoneDigits(lead.phone_number);
   return ok ? { code: "completed", label: "שיחה מלאה" } : { code: "partial", label: "שיחה חלקית" };
 }
 
@@ -368,7 +376,6 @@ app.post("/twilio-recording-callback", async (req, res) => {
     const c = getCall(callSid);
     if (recordingSid) c.recordingSid = recordingSid;
     if (recordingUrl) c.recordingUrl = recordingUrl;
-    // ✅ אין שליחה ל-MAKE פה (בוטל הוובהוק השני)
   }
 
   res.status(200).send("OK");
@@ -416,7 +423,7 @@ async function sendFinal(callSid, reason) {
     await waitForRecording(callSid, 8000); // 8s
   }
 
-  const status = computeStatus(c.lead, c.meta.consent);
+  const status = computeStatus(c.lead);
   const origin = getPublicOrigin();
   const publicRecording = c.recordingSid && origin ? `${origin}/recording/${c.recordingSid}.mp3` : "";
 
@@ -443,7 +450,7 @@ async function sendFinal(callSid, reason) {
     source: "Voice AI - Nice Line",
     timestamp: nowIso(),
     reason: reason || "call_end",
-    remarks: `סטטוס: ${status.label} | consent: ${c.meta.consent || ""} | name: ${c.lead.first_name || ""} ${c.lead.last_name || ""}`.trim(),
+    remarks: `סטטוס: ${status.label} | consent: ${c.meta.consent || "assumed"} | name: ${c.lead.first_name || ""} ${c.lead.last_name || ""}`.trim(),
   };
 
   if (ENV.MB_LOG_CRM) logInfo("CRM> sending FINAL", payload);
@@ -475,7 +482,6 @@ wss.on("connection", (twilioWs) => {
   let maxCallWarnTimer = null;
 
   const STATES = {
-    ASK_CONSENT: "ASK_CONSENT",
     ASK_NAME: "ASK_NAME",
     CONFIRM_NAME: "CONFIRM_NAME",
     ASK_NAME_CORRECT: "ASK_NAME_CORRECT",
@@ -484,9 +490,11 @@ wss.on("connection", (twilioWs) => {
     CONFIRM_PHONE: "CONFIRM_PHONE",
     DONE: "DONE",
   };
-  let state = STATES.ASK_CONSENT;
 
-  const retries = { consent: 0, name: 0, nameConfirm: 0, phone: 0, confirmPhone: 0 };
+  // (כירורגי) ביטלנו ASK_CONSENT — מתחילים ישר מהשם
+  let state = STATES.ASK_NAME;
+
+  const retries = { name: 0, nameConfirm: 0, phone: 0, confirmPhone: 0 };
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
 
@@ -588,7 +596,6 @@ wss.on("connection", (twilioWs) => {
   }
 
   function createResponse(text) {
-    // (כירורגי): טון יותר אנושי + מעט יותר מהיר (ההנחיות לא נאמרות בשיחה)
     sendOpenAI({
       type: "response.create",
       response: {
@@ -603,10 +610,6 @@ wss.on("connection", (twilioWs) => {
   }
 
   function askCurrentQuestionQueued() {
-    if (state === STATES.ASK_CONSENT) {
-      sayQueue("זה בסדר מבחינתכם?");
-      return;
-    }
     if (state === STATES.ASK_NAME) {
       sayQueue("מצוין. איך קוראים לכם? אפשר שם פרטי ושם משפחה.");
       return;
@@ -701,10 +704,23 @@ wss.on("connection", (twilioWs) => {
 
   function advanceAfter(userText) {
     const c = getCall(callSid);
+
+    // (כירורגי) זיכרון 50 שניות תמלולים
+    addTranscriptMemory(callSid, userText);
+
     if (ENV.MB_LOG_TRANSCRIPTS) logInfo("USER>", userText);
 
     armIdleTimers();
 
+    // סירוב בכל שלב
+    if (isRefusal(userText)) {
+      c.meta.consent = "no";
+      sayQueue("בסדר גמור, תודה רבה ויום נעים.");
+      finishCall("user_refused").catch(() => {});
+      return;
+    }
+
+    // שאלות על פרטים/קורסים וכו' -> תשובה קצרה וסיום (כמו שהיה)
     if (isQuestionAboutDetails(userText)) {
       sayQueue(
         "זו שאלה חשובה, ויועץ לימודים ישמח להסביר לכם את כל הפרטים בצורה מדויקת ומותאמת אישית. אני כאן רק כדי להעביר את הפניה, והוא יחזור אליכם בהקדם."
@@ -713,37 +729,14 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    if (isRefusal(userText)) {
-      c.meta.consent = "no";
-      sayQueue("בסדר גמור, תודה רבה ויום נעים.");
-      finishCall("user_refused").catch(() => {});
-      return;
-    }
-
-    if (state === STATES.ASK_CONSENT) {
+    // (כירורגי) אם אחרי הפתיח ענו רק "כן/בסדר" — לא נחשיב ככישלון שם, פשוט נמשיך לשאלת השם
+    if (state === STATES.ASK_NAME) {
       const yn = detectYesNo(userText);
-      if (yn === "yes") {
-        c.meta.consent = "yes";
-        state = STATES.ASK_NAME;
-        logInfo("[STATE] ASK_CONSENT -> ASK_NAME");
+      const t = normalizeText(userText);
+      if (yn === "yes" && t.length <= 8) {
         askCurrentQuestionQueued();
         return;
       }
-      if (yn === "no") {
-        c.meta.consent = "no";
-        sayQueue("בסדר גמור, תודה רבה ויום נעים.");
-        finishCall("consent_no").catch(() => {});
-        return;
-      }
-
-      if (retries.consent >= 1) {
-        sayQueue("בסדר גמור, תודה רבה ויום נעים.");
-        finishCall("consent_unclear").catch(() => {});
-        return;
-      }
-      retries.consent += 1;
-      sayQueue("רק לוודא — זה בסדר מבחינתכם?");
-      return;
     }
 
     if (state === STATES.ASK_NAME) {
@@ -923,15 +916,28 @@ wss.on("connection", (twilioWs) => {
         input_audio_transcription: {
           model: "gpt-4o-mini-transcribe",
           language: ENV.MB_STT_LANGUAGE,
+          // (כירורגי) חיזוק תמלול לעברית "רבנית/היימיש" + מונחים נפוצים
+          prompt:
+            "תמללו בעברית תקינה. העדיפו כתיב עברי למונחים ומילים רבניות/היימיש. " +
+            "דוגמאות מונחים: רב, רבנות, דיינות, טוען רבני, בית דין, ברכה, קמע, בעזרת השם, בלי עין הרע, ברוך השם, אמן. " +
+            "מספרי טלפון בישראל מתחילים לרוב ב-0 (אפס).",
         },
       },
     });
 
     setTimeout(() => {
-      state = STATES.ASK_CONSENT;
-      logInfo("[STATE] ASK_CONSENT | waiting user");
+      // (כירורגי) מתחילים ישר מהשם, לא מהסכמה
+      state = STATES.ASK_NAME;
+      logInfo("[STATE] ASK_NAME | waiting user");
       armIdleTimers();
       armMaxCallTimers();
+
+      // לא שואלים מיד אם הפתיח כבר רץ — נחכה לתשובת הלקוח ואז נתקדם (כמו עובד היום)
+      // אם אין פתיח בטוויליו, נשאל שם דרך MB_OPENING_TEXT (לפי הקיים)
+      if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
+        // אם אין פתיח טוויליו, הקוד הקיים מקריא פתיח טקסטואלי; נשאיר כרגיל
+        // (הפתיח נשאר, אבל אין "וידוא הסכמה" אצלנו)
+      }
     }, 200);
   });
 
