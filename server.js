@@ -1,21 +1,15 @@
 // server.js
 //
-// NiceLine / מרכז מל"מ – Voice AI (מוטי) – תסריט רישום
+// NiceLine / מרכז מל"מ – Voice AI
 // Twilio Media Streams <-> OpenAI Realtime API (WS) on Render
 //
-// FIX (כירורגי בלבד לפי בקשת המשתמש):
-// ✅ אין שאלת "האם זה בסדר" בכלל.
-// ✅ אחרי שה-Stream מתחיל (אחרי ה-MP3 בטוויליו) – הבוט יוזם מיד ASK_NAME בלי לחכות למשתמש.
-// ✅ סינון טרנסקריפטים "מזוייפים" (למשל STT prompt שחוזר בטעות).
-// ✅ הקשחת זיהוי שם כדי לא לקלוט "לדבר/נו/תמשיך" כשם.
-// ✅ CONFIRM_NAME: לא מחלצים/מחליפים שם מתוך תלונות/משפטים.
-// ✅ מהירות דיבור: מינימום 1.08 תמיד.
-// ✅ הוובהוק והשדות נשארים כפי שהיו (לא נוגעים).
+// ✅ MODE: "HARD SCRIPT" (אנטי-קטיעות/רעשים)
+// - אין שאלת הסכמה אחרי הפתיח.
+// - תסריט קשיח: ASK_NAME -> CONFIRM_NAME -> CONFIRM_CALLER_LAST4 (או ASK_PHONE) -> DONE
+// - בסטייטים של אישור: רק כן/לא. כל דבר אחר = חזרה קצרה על השאלה.
+// - אם STT מזייף/רעש/קטיעה: לא עונים על "מחיר/מסלולים" וכו' — חוזרים לתסריט.
 //
-// PATCH (רק ניסוח שאלות + אישור קצר אחרי אישור מספר):
-// - שאלות קצרות יותר
-// - וידוא שם נשמע ברור
-// - אחרי "כן" על 4 ספרות: "רשמתי." ואז סגיר
+// ⚠️ ENV names unchanged. Webhook payload unchanged.
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -165,36 +159,8 @@ function isRefusal(text) {
     t === "ביי" ||
     t.includes("תעזבו") ||
     t.includes("לא מעוניין") ||
+    t.includes("לא מעוניינת") ||
     t === "לא"
-  );
-}
-
-function isQuestionAboutDetails(text) {
-  const t = normalizeText(text);
-  return (
-    t.includes("מחיר") ||
-    t.includes("כמה עולה") ||
-    t.includes("תוכן") ||
-    t.includes("מסלולים") ||
-    t.includes("מועדים") ||
-    t.includes("התאמה") ||
-    t.includes("מי אתם") ||
-    t.includes("מה זה") ||
-    t.includes("איפה") ||
-    t.includes("מתי")
-  );
-}
-
-function wantsNameCorrection(text) {
-  const t = normalizeText(text);
-  return (
-    t.includes("שם") ||
-    t.includes("תכתוב") ||
-    t.includes("תרשום") ||
-    t.includes("תעתיק") ||
-    t.includes("תתקן") ||
-    t.includes("לא שמעת") ||
-    t.includes("לא הבנת")
   );
 }
 
@@ -265,6 +231,103 @@ function extractPhoneFromTranscript(text) {
   const joined = digits.join("");
   if (joined.length >= 9 && joined.length <= 10) return joined;
   return "";
+}
+
+// -------------------- HARD-SCRIPT guards --------------------
+const STT_GARBAGE_PHRASES = [
+  "תמללו בעברית תקינה",
+  "מספרי טלפון בישראל",
+  "input_audio_transcription",
+  "language",
+  "prompt",
+];
+
+function isGarbageTranscript(text) {
+  const t = (text || "").toString().trim();
+  if (!t) return true;
+  for (const p of STT_GARBAGE_PHRASES) {
+    if (t.includes(p)) return true;
+  }
+  return false;
+}
+
+function isUnreliableYesNo(text) {
+  // כשמצפים "כן/לא" — אם הגיע משפט ארוך/מורכב זה כמעט תמיד STT מזויף/קטיעה
+  const t = normalizeText(text);
+  if (!t) return true;
+  const tokens = t.split(" ").filter(Boolean);
+  if (tokens.length > 6) return true;
+  if (t.length > 40) return true;
+  return false;
+}
+
+function looksLikeQuestionOrDetails(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  return (
+    t.includes("כמה") ||
+    t.includes("מחיר") ||
+    t.includes("עולה") ||
+    t.includes("מסלול") ||
+    t.includes("קורס") ||
+    t.includes("מועד") ||
+    t.includes("תוכן") ||
+    t.includes("פרטים") ||
+    t.includes("איפה") ||
+    t.includes("מתי") ||
+    t.includes("איך זה עובד")
+  );
+}
+
+// ----- Name parsing -----
+const NAME_TRASH = new Set([
+  "הלו",
+  "שלום",
+  "היי",
+  "כן",
+  "לא",
+  "אוקיי",
+  "אוקי",
+  "בסדר",
+  "מי",
+  "מה",
+  "מה זה",
+  "מי זה",
+  "נו",
+  "דבר",
+  "לדבר",
+  "תמשיך",
+  "תמשיכו",
+  "קדימה",
+  "יאללה",
+]);
+
+function isTrashName(name) {
+  const t = normalizeText(name);
+  if (!t) return true;
+  if (NAME_TRASH.has(t)) return true;
+  if (t.length < 2) return true;
+  if (t.split(" ").length > 5) return true;
+  return false;
+}
+
+function cleanHebrewName(raw) {
+  return (raw || "")
+    .toString()
+    .replace(/[0-9]/g, " ")
+    .replace(/[^\p{L}\p{M}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseName(text) {
+  const raw = cleanHebrewName(text);
+  if (!raw) return null;
+  if (isTrashName(raw)) return null;
+
+  const parts = raw.split(" ").filter(Boolean);
+  if (parts.length === 1) return { first: parts[0], last: "" };
+  return { first: parts[0], last: parts.slice(1).join(" ") };
 }
 
 // -------------------- HTTP helpers --------------------
@@ -528,9 +591,7 @@ wss.on("connection", (twilioWs) => {
 
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
-  let phoneConfirmedFromCaller = false;
 
-  // ✅ יוזמה אחרי פתיח: נתחיל רק כשיש גם start מ-Twilio וגם open מ-OpenAI
   let gotTwilioStart = false;
   let gotOpenAI = false;
   let flowStarted = false;
@@ -638,9 +699,9 @@ wss.on("connection", (twilioWs) => {
       response: {
         instructions:
           `דברו בעברית תקינה, בלשון רבים בלבד.\n` +
-          `טון אנושי, חברי וחם (לא רשמי מדי), זורם ובטוח.\n` +
+          `טון אנושי, חברי וחם (לא רשמי מדי), קצר וברור.\n` +
           `קצב דיבור מהיר יחסית אבל ברור (סביב ${EFFECTIVE_SPEECH_SPEED}).\n` +
-          `אם מקריאים מספרים/ספרות – להקריא ספרה-ספרה בצורה ברורה.\n\n` +
+          `אם מקריאים מספרים/ספרות – להקריא ספרה-ספרה.\n\n` +
           `הטקסט להקראה (להגיד בדיוק):\n${text}`,
       },
     });
@@ -693,75 +754,6 @@ wss.on("connection", (twilioWs) => {
     }, 180);
   }
 
-  // ----- Name parsing -----
-  const NAME_TRASH = new Set([
-    "הלו",
-    "שלום",
-    "היי",
-    "כן",
-    "לא",
-    "אוקיי",
-    "אוקי",
-    "בסדר",
-    "מי",
-    "מה",
-    "מה זה",
-    "מי זה",
-    "נו",
-    "דבר",
-    "לדבר",
-    "תמשיך",
-    "תמשיכו",
-    "קדימה",
-    "יאללה",
-  ]);
-  const NAME_BLOCK_PHRASES = [
-    "תמללו בעברית תקינה",
-    "מספרי טלפון בישראל",
-    "מתחילים לרוב ב",
-    "input_audio_transcription",
-  ];
-
-  function isGarbageTranscript(text) {
-    const t = (text || "").toString().trim();
-    if (!t) return true;
-    const n = normalizeText(t);
-    if (!n) return true;
-
-    for (const p of NAME_BLOCK_PHRASES) {
-      if (t.includes(p)) return true;
-    }
-    return false;
-  }
-
-  function isTrashName(name) {
-    const t = normalizeText(name);
-    if (!t) return true;
-    if (NAME_TRASH.has(t)) return true;
-    if (t.length < 2) return true;
-    if (t.split(" ").length > 5) return true;
-    return false;
-  }
-
-  function cleanHebrewName(raw) {
-    return (raw || "")
-      .toString()
-      .replace(/[0-9]/g, " ")
-      .replace(/[^\p{L}\p{M}\s]/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  function parseName(text) {
-    const raw = cleanHebrewName(text);
-    if (!raw) return null;
-    if (isTrashName(raw)) return null;
-
-    const parts = raw.split(" ").filter(Boolean);
-    if (parts.length === 1) return { first: parts[0], last: "" };
-    return { first: parts[0], last: parts.slice(1).join(" ") };
-  }
-
   function saveNameToLead(nameObj) {
     const c = getCall(callSid);
     c.lead.first_name = nameObj.first || "";
@@ -809,6 +801,24 @@ wss.on("connection", (twilioWs) => {
     }, endAfterMs);
   }
 
+  function hardYesNoGate(userText) {
+    // בסטייטים של אישור: אם לא כן/לא ברור — לא עושים שום דבר אחר.
+    if (state === STATES.CONFIRM_NAME || state === STATES.CONFIRM_CALLER_LAST4 || state === STATES.CONFIRM_PHONE) {
+      const yn = detectYesNo(userText);
+      if (yn) return { ok: true, yn };
+      // אם זה ארוך/מוזר => מבקשים שוב קצר
+      if (isUnreliableYesNo(userText)) {
+        sayQueue("לא שמעתי טוב. כן או לא?");
+      } else {
+        sayQueue("כן או לא?");
+      }
+      // חוזרים על אותה שאלה
+      askCurrentQuestionQueued();
+      return { ok: false, yn: null };
+    }
+    return { ok: true, yn: null };
+  }
+
   function advanceAfter(userText) {
     const c = getCall(callSid);
 
@@ -822,41 +832,59 @@ wss.on("connection", (twilioWs) => {
 
     armIdleTimers();
 
+    // סירוב ברור בכל שלב -> סוגרים יפה (זה כן חלק מהתסריט)
     if (isRefusal(userText)) {
-      sayQueue("ברור. תודה רבה ויום נעים.");
+      sayQueue("בסדר. תודה רבה ויום נעים.");
       finishCall("user_refused", { skipClosing: true }).catch(() => {});
       return;
     }
 
-    if (isQuestionAboutDetails(userText)) {
-      sayQueue("אני כאן רק לרישום קצר כדי שנציג יחזור אליכם. ממשיכים.");
-      askCurrentQuestionQueued();
-      return;
-    }
+    // HARD gate לסטייטים של אישור
+    const gate = hardYesNoGate(userText);
+    if (!gate.ok) return;
 
-    if (state === STATES.ASK_NAME) {
-      const yn = detectYesNo(userText);
-      const t = normalizeText(userText);
-      if (yn === "yes" || (t.length <= 8 && (t === "בסדר" || t === "אוקיי" || t === "אוקי" || t === "סבבה" || t === "כן"))) {
+    // אם המשתמש שואל פרטים/מחיר וכו' — לא עונים, רק חוזרים לתסריט (קצר)
+    if (looksLikeQuestionOrDetails(userText)) {
+      if (state === STATES.ASK_NAME || state === STATES.ASK_NAME_CORRECT) {
+        sayQueue("רק לרישום קצר.");
         askCurrentQuestionQueued();
         return;
       }
+      // אם הוא שאל בזמן אישור — ה-gate כבר טיפל בזה
     }
 
     // -------- FLOW --------
     if (state === STATES.ASK_NAME) {
-      const nameObj = parseName(userText);
-      if (!nameObj) {
-        retries.name += 1;
-        if (retries.name >= 3) {
-          sayQueue("לא הצלחתי לקלוט שם ברור. יום נעים.");
-          finishCall("name_missing", { skipClosing: true }).catch(() => {});
-          return;
-        }
-        sayQueue("תגידו שם פרטי ושם משפחה, בבקשה.");
+      // אם אמר "כן/בסדר" אחרי פתיח — זה לא שם. חוזרים לשאלה.
+      const yn = detectYesNo(userText);
+      if (yn === "yes") {
+        askCurrentQuestionQueued();
         return;
       }
 
+      const t = normalizeText(userText);
+      const tokens = t.split(" ").filter(Boolean);
+      // משפט ארוך מדי = חשוד (קטיעה/רעש)
+      if (tokens.length > 6 || t.length > 45) {
+        sayQueue("לא שמעתי טוב.");
+        askCurrentQuestionQueued();
+        return;
+      }
+
+      const nameObj = parseName(userText);
+      if (!nameObj || !nameObj.first) {
+        retries.name += 1;
+        if (retries.name >= 3) {
+          sayQueue("לא הצלחתי לקלוט שם. יום נעים.");
+          finishCall("name_missing", { skipClosing: true }).catch(() => {});
+          return;
+        }
+        sayQueue("לא שמעתי טוב.");
+        askCurrentQuestionQueued();
+        return;
+      }
+
+      // חייבים וידוא שם תמיד
       pendingName = nameObj;
       state = STATES.CONFIRM_NAME;
       logInfo("[STATE] ASK_NAME -> CONFIRM_NAME", pendingName);
@@ -865,17 +893,10 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (state === STATES.CONFIRM_NAME) {
-      const yn = detectYesNo(userText);
+      const yn = gate.yn || detectYesNo(userText);
 
       if (yn === "yes") {
         saveNameToLead(pendingName);
-
-        if (phoneConfirmedFromCaller) {
-          logInfo("[STATE] CONFIRM_NAME -> DONE (phone already confirmed)");
-          finishCall("completed_flow").catch(() => {});
-          return;
-        }
-
         state = callerPhoneLocal ? STATES.CONFIRM_CALLER_LAST4 : STATES.ASK_PHONE;
         logInfo("[STATE] CONFIRM_NAME ->", state);
         askCurrentQuestionQueued();
@@ -883,23 +904,39 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (yn === "no") {
-        retries.nameConfirm += 1;
         state = STATES.ASK_NAME_CORRECT;
         logInfo("[STATE] CONFIRM_NAME -> ASK_NAME_CORRECT");
         askCurrentQuestionQueued();
         return;
       }
 
-      sayQueue("נכון? כן או לא.");
+      // לא אמור להגיע לכאן בגלל gate
+      askCurrentQuestionQueued();
       return;
     }
 
     if (state === STATES.ASK_NAME_CORRECT) {
-      const nameObj = parseName(userText);
-      if (!nameObj) {
-        sayQueue("לא הבנתי. תגידו שוב שם פרטי ושם משפחה.");
+      const t = normalizeText(userText);
+      const tokens = t.split(" ").filter(Boolean);
+      if (tokens.length > 6 || t.length > 45) {
+        sayQueue("לא שמעתי טוב.");
+        askCurrentQuestionQueued();
         return;
       }
+
+      const nameObj = parseName(userText);
+      if (!nameObj || !nameObj.first) {
+        retries.name += 1;
+        if (retries.name >= 3) {
+          sayQueue("לא הצלחתי לקלוט שם. יום נעים.");
+          finishCall("name_missing", { skipClosing: true }).catch(() => {});
+          return;
+        }
+        sayQueue("לא שמעתי טוב.");
+        askCurrentQuestionQueued();
+        return;
+      }
+
       pendingName = nameObj;
       state = STATES.CONFIRM_NAME;
       logInfo("[STATE] ASK_NAME_CORRECT -> CONFIRM_NAME", pendingName);
@@ -908,24 +945,13 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (state === STATES.CONFIRM_CALLER_LAST4) {
-      const yn = detectYesNo(userText);
-
-      if (yn === "yes" && wantsNameCorrection(userText)) {
-        c.lead.phone_number = callerPhoneLocal;
-        phoneConfirmedFromCaller = true;
-
-        state = STATES.ASK_NAME_CORRECT;
-        logInfo("[STATE] CONFIRM_CALLER_LAST4 -> ASK_NAME_CORRECT (name correction requested)");
-        sayQueue("בטח. נתקן את השם.");
-        askCurrentQuestionQueued();
-        return;
-      }
+      const yn = gate.yn || detectYesNo(userText);
 
       if (yn === "yes") {
         c.lead.phone_number = callerPhoneLocal;
         logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (use caller)", { phone_number: callerPhoneLocal });
 
-        // אישור קצר כדי שהלקוח ישמע שנקלט "כן"
+        // אישור קצר כדי שהלקוח ישמע שזה נקלט
         sayQueue("רשמתי.");
 
         finishCall("completed_flow").catch(() => {});
@@ -939,7 +965,8 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      sayQueue("זה המספר הנכון? כן או לא.");
+      // לא אמור להגיע לכאן בגלל gate
+      askCurrentQuestionQueued();
       return;
     }
 
@@ -953,7 +980,8 @@ wss.on("connection", (twilioWs) => {
           finishCall("invalid_phone", { skipClosing: true }).catch(() => {});
           return;
         }
-        sayQueue("צריך 9–10 ספרות. תגידו ספרה-ספרה.");
+        sayQueue("לא שמעתי טוב.");
+        askCurrentQuestionQueued();
         return;
       }
 
@@ -965,31 +993,27 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (state === STATES.CONFIRM_PHONE) {
-      const yn = detectYesNo(userText);
+      const yn = gate.yn || detectYesNo(userText);
+
       if (yn === "yes") {
         c.lead.phone_number = pendingPhone;
         logInfo("[STATE] CONFIRM_PHONE -> DONE", { phone_number: pendingPhone });
+
+        sayQueue("רשמתי.");
+
         finishCall("completed_flow").catch(() => {});
         return;
       }
+
       if (yn === "no") {
-        retries.confirmPhone += 1;
-        if (retries.confirmPhone >= 2) {
-          sayQueue("אוקיי. נרשום שוב.");
-        }
         state = STATES.ASK_PHONE;
+        logInfo("[STATE] CONFIRM_PHONE -> ASK_PHONE");
         askCurrentQuestionQueued();
         return;
       }
 
-      const p = extractPhoneFromTranscript(userText);
-      if (p && isValidILPhoneDigits(p)) {
-        pendingPhone = p;
-        askCurrentQuestionQueued();
-        return;
-      }
-
-      sayQueue("זה המספר הנכון? כן או לא.");
+      // לא אמור להגיע לכאן בגלל gate
+      askCurrentQuestionQueued();
       return;
     }
   }
@@ -1113,6 +1137,7 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
+      // אם אין MP3 — אפשר לפתוח ב-MB_OPENING_TEXT. אם יש MP3 בטוויליו — מתחילים מיד.
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
         sayQueue(ENV.MB_OPENING_TEXT);
         setTimeout(() => {
