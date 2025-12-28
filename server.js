@@ -4,13 +4,13 @@
 // Twilio Media Streams <-> OpenAI Realtime API (WS) on Render
 //
 // FIX (כירורגי בלבד לפי בקשת המשתמש):
-// 1) CONFIRM_NAME: לא מחלצים/מחליפים שם מתוך משפטים לא קשורים. שם משתנה רק ב-ASK_NAME / ASK_NAME_CORRECT.
-// 2) שאלות "כמה עולה/פרטים/מסלולים" לא מסיימות שיחה ולא שולחות ליד ריק — עונים קצר וחוזרים לפלואו.
-// 3) detectYesNo יציב יותר: "כן/בסדר/אוקיי/בטח" מול "לא/לא רוצה" בלי ליפול על "לא" בתוך משפט ארוך.
-// 4) זרימה רציפה: קלט תקין => מעבר מיידי לשאלה הבאה.
-// 5) מהירות דיבור: מינימום 1.08 תמיד (גם אם ENV לא משפיע).
+// ✅ אין שאלת "האם זה בסדר מבחינתכם" בכלל (ה-MP3 כבר בלי שאלה).
+// ✅ אחרי הפתיח: ישר ASK_NAME -> CONFIRM_NAME -> CONFIRM_CALLER_LAST4 -> DONE
+// ✅ CONFIRM_NAME: לא מחלצים/מחליפים שם מתוך משפטים לא קשורים. שם משתנה רק ב-ASK_NAME / ASK_NAME_CORRECT.
+// ✅ זיהוי כן/לא גמיש (כן/בסדר/אוקיי/בטח וכו') בלי "תקיעות".
+// ✅ מהירות דיבור: מינימום 1.08 תמיד (גם אם ENV לא משפיע).
 //
-// כל היתר נשמר כפי שהיה.
+// כל היתר (כולל הוובהוק והשדות) נשמר כפי שהיה.
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -106,7 +106,7 @@ function normalizeText(s) {
     .toLowerCase();
 }
 
-// יציב יותר: טוקנים + חוקים כדי לא ליפול על "לא" בתוך נאום ארוך
+// זיהוי "כן/לא" גמיש אבל יציב
 function detectYesNo(s) {
   const raw = safeStr(s);
   if (!raw) return null;
@@ -117,24 +117,18 @@ function detectYesNo(s) {
   const tokens = t.split(" ").filter(Boolean);
 
   const YES_SET = new Set(["כן", "בטח", "בסדר", "אוקיי", "אוקי", "ok", "okay", "yes", "נכון", "מאשר", "מאשרת", "סבבה", "יאללה"]);
-  const NO_SET = new Set(["לא", "לאpe", "no", "לא רוצה", "לא מעוניין", "לא מעוניינת", "ממש לא", "עזוב", "עזבי"]);
-
   const hasYesToken = tokens.some((w) => YES_SET.has(w));
   const hasNoToken = tokens.some((w) => w === "לא" || w === "no");
 
-  // ביטויי סירוב חזקים:
   const hasStrongNo =
     t.includes("לא רוצה") || t.includes("לא מעוניין") || t.includes("לא מעוניינת") || t.includes("ממש לא") || t === "עזוב" || t === "עזבי";
 
-  // אם יש גם כן וגם לא/או ערבוב — לא חד משמעי
   if ((hasYesToken && hasNoToken) || (hasYesToken && hasStrongNo)) return null;
 
-  // תשובות קצרות נחשבות יותר
   const short = tokens.length <= 4;
 
   if (hasStrongNo) return "no";
   if (hasNoToken && short) return "no";
-
   if (hasYesToken) return "yes";
 
   return null;
@@ -159,15 +153,6 @@ function isQuestionAboutDetails(text) {
     t.includes("איפה") ||
     t.includes("מתי")
   );
-}
-
-// (B) זיהוי "אמרתי כן/עניתי כן/..." כדי לא להיכנס לטעות שם
-function isOpeningYesPhrase(text) {
-  const t = normalizeText(text);
-  if (!t) return false;
-  const hasYes = t.includes("כן") || t === "ok" || t === "okay";
-  const hasSaid = t.includes("אמרתי") || t.includes("עניתי") || t.includes("אמר") || t.includes("אמרתי לכם") || t.includes("אמרתי כן");
-  return hasYes && (hasSaid || t.startsWith("אמר") || t.includes("אמר ") || t.includes("אמרתי "));
 }
 
 function wantsNameCorrection(text) {
@@ -383,7 +368,7 @@ function getCall(callSid) {
       recordingSid: "",
       recordingUrl: "",
       lead: { first_name: "", last_name: "", phone_number: "", study_track: "" },
-      meta: { consent: "assumed" },
+      meta: { consent: "skipped" }, // אין הסכמה בשיחה יותר
       memory: { transcripts: [] },
       finalSent: false,
       finalTimer: null,
@@ -491,7 +476,7 @@ async function sendFinal(callSid, reason) {
     source: "Voice AI - Nice Line",
     timestamp: nowIso(),
     reason: reason || "call_end",
-    remarks: `סטטוס: ${status.label} | consent: ${c.meta.consent || "assumed"} | name: ${c.lead.first_name || ""} ${c.lead.last_name || ""}`.trim(),
+    remarks: `סטטוס: ${status.label} | consent: ${c.meta.consent || "skipped"} | name: ${c.lead.first_name || ""} ${c.lead.last_name || ""}`.trim(),
   };
 
   if (ENV.MB_LOG_CRM) logInfo("CRM> sending FINAL", payload);
@@ -539,15 +524,11 @@ wss.on("connection", (twilioWs) => {
     nameConfirm: 0,
     phone: 0,
     confirmPhone: 0,
-    consent: 0,
   };
 
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
   let phoneConfirmedFromCaller = false;
-
-  // אם פתיח MP3 כבר שאל הסכמה — נחכה לתשובת כן/לא
-  let awaitingOpeningConsent = false;
 
   function clearTimers() {
     if (idleWarnTimer) clearTimeout(idleWarnTimer);
@@ -561,12 +542,8 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_IDLE_WARNING_MS > 0) {
       if (idleWarnTimer) clearTimeout(idleWarnTimer);
       idleWarnTimer = setTimeout(() => {
-        if (awaitingOpeningConsent) {
-          sayQueue("רק כדי לוודא—זה בסדר מבחינתכם? אפשר לענות כן או לא.");
-        } else {
-          sayQueue("רק לוודא שאתם איתנו—תענו לי רגע בבקשה.");
-          askCurrentQuestionQueued();
-        }
+        sayQueue("רק לוודא שאתם איתנו—תענו לי רגע בבקשה.");
+        askCurrentQuestionQueued();
       }, ENV.MB_IDLE_WARNING_MS);
     }
     if (ENV.MB_IDLE_HANGUP_MS > 0) {
@@ -582,7 +559,7 @@ wss.on("connection", (twilioWs) => {
       const warnAt = Math.max(0, ENV.MB_MAX_CALL_MS - ENV.MB_MAX_WARN_BEFORE_MS);
       maxCallWarnTimer = setTimeout(() => {
         sayQueue("רק עוד רגע קטן ואנחנו מסיימים—בואו נשלים את הפרטים וזהו.");
-        if (!awaitingOpeningConsent) askCurrentQuestionQueued();
+        askCurrentQuestionQueued();
       }, warnAt);
     }
     if (ENV.MB_MAX_CALL_MS > 0) {
@@ -721,7 +698,6 @@ wss.on("connection", (twilioWs) => {
     const raw = cleanHebrewName(text);
     if (!raw) return null;
     if (isTrashName(raw)) return null;
-    if (isOpeningYesPhrase(raw)) return null;
 
     const parts = raw.split(" ").filter(Boolean);
     if (parts.length === 1) return { first: parts[0], last: "" };
@@ -744,7 +720,7 @@ wss.on("connection", (twilioWs) => {
       if (!skipClosing) {
         const closing =
           ENV.MB_CLOSING_TEXT ||
-          "תודה רבה, זה הכול. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
+          "תודה רבה, הפרטים נרשמו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
         sayQueue(closing);
       }
     }
@@ -779,61 +755,25 @@ wss.on("connection", (twilioWs) => {
 
     armIdleTimers();
 
-    // 1) אם הפתיח של טוויליו כבר שאל "זה בסדר?" — קודם מטפלים בהסכמה
-    if (awaitingOpeningConsent) {
-      const yn = detectYesNo(userText);
-
-      if (yn === "no" || isRefusal(userText)) {
-        c.meta.consent = "no";
-        sayQueue("בסדר גמור. תודה רבה ויום נעים.");
-        awaitingOpeningConsent = false;
-        finishCall("user_refused_opening", { skipClosing: true }).catch(() => {});
-        return;
-      }
-
-      if (yn === "yes" || isOpeningYesPhrase(userText)) {
-        c.meta.consent = "yes";
-        awaitingOpeningConsent = false;
-        state = STATES.ASK_NAME;
-        askCurrentQuestionQueued();
-        return;
-      }
-
-      retries.consent += 1;
-      if (retries.consent >= 2) {
-        // עדיין לא ברור? נתקדם למסילה אבל בלי לשאול שוב "הסכמה" (כדי לא להיתקע)
-        c.meta.consent = "unclear_opening";
-        awaitingOpeningConsent = false;
-        state = STATES.ASK_NAME;
-        sayQueue("סבבה, בואו נתקדם מהר—רק כדי שאוכל להעביר את הפניה.");
-        askCurrentQuestionQueued();
-        return;
-      }
-
-      sayQueue("רק כן או לא בבקשה—זה בסדר מבחינתכם?");
-      return;
-    }
-
-    // סירוב כללי
+    // סירוב כללי בלבד
     if (isRefusal(userText)) {
-      c.meta.consent = "no";
       sayQueue("ברור. תודה רבה ויום נעים.");
-      finishCall("user_refused").catch(() => {});
+      finishCall("user_refused", { skipClosing: true }).catch(() => {});
       return;
     }
 
-    // 2) שאלות על פרטים/מחיר לא עוצרות ולא מסיימות — חוזרים לפלואו
+    // שאלות על פרטים/מחיר לא משנות פלואו — עונים קצר וחוזרים לשאלה הנוכחית
     if (isQuestionAboutDetails(userText)) {
-      sayQueue("מבין לגמרי. אני כאן רק לרישום קצר כדי שיועץ לימודים יחזור אליכם—ממשיכים רגע.");
+      sayQueue("מבין לגמרי. אני כאן רק לרישום קצר כדי שנציג יחזור אליכם—ממשיכים רגע.");
       askCurrentQuestionQueued();
       return;
     }
 
-    // אם המשתמש "מאשר" במקום לענות שם בשלב ASK_NAME — פשוט שואלים שם שוב, בלי להיתקע
+    // אם המשתמש אומר "כן/בסדר" בזמן ASK_NAME (הרגל מהגרסה הקודמת) — פשוט נשאל שם שוב
     if (state === STATES.ASK_NAME) {
       const yn = detectYesNo(userText);
       const t = normalizeText(userText);
-      if (yn === "yes" || isOpeningYesPhrase(userText) || (t.length <= 8 && (t === "בסדר" || t === "אוקיי" || t === "אוקי" || t === "סבבה"))) {
+      if (yn === "yes" || (t.length <= 8 && (t === "בסדר" || t === "אוקיי" || t === "אוקי" || t === "סבבה" || t === "כן"))) {
         askCurrentQuestionQueued();
         return;
       }
@@ -846,12 +786,11 @@ wss.on("connection", (twilioWs) => {
       if (!nameObj) {
         retries.name += 1;
         if (retries.name >= 3) {
-          // לא הצלחנו לקבל שם אחרי כמה נסיונות — סוגרים חלקית (אבל לא "ממציאים" שם/לא קופצים לטלפון)
-          sayQueue("לא הצלחתי לקלוט שם ברור. אין בעיה—נסיים כאן, ואם תרצו אפשר לנסות שוב.");
-          finishCall("name_missing").catch(() => {});
+          sayQueue("לא הצלחתי לקלוט שם ברור. אין בעיה—אפשר לנסות שוב בשיחה נוספת. יום נעים.");
+          finishCall("name_missing", { skipClosing: true }).catch(() => {});
           return;
         }
-        sayQueue("רק כדי שאוכל להעביר את הפניה—תגידו לי שם פרטי ושם משפחה, בבקשה.");
+        sayQueue("רק כדי להעביר את הפניה—תגידו לי שם פרטי ושם משפחה, בבקשה.");
         return;
       }
 
@@ -888,8 +827,8 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // *** תיקון קריטי: לא מחלצים שם מתוך משפט כאן ***
-      sayQueue("רק כדי לוודא—זה נכון? אפשר לענות כן או לא.");
+      // קריטי: לא מחלצים שם מתוך משפט כאן
+      sayQueue("רק לוודא—נכון? אפשר לענות כן או לא.");
       return;
     }
 
@@ -934,7 +873,6 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // לא ברור — נשאל שוב בקצרה
       sayQueue("רק כן או לא בבקשה—זה המספר הנכון לחזרה?");
       return;
     }
@@ -945,11 +883,11 @@ wss.on("connection", (twilioWs) => {
       if (!p || !isValidILPhoneDigits(p)) {
         retries.phone += 1;
         if (retries.phone >= 3) {
-          sayQueue("לא הצלחתי לקלוט מספר תקין. אין בעיה—נסיים כאן, ואם תרצו אפשר לנסות שוב.");
-          finishCall("invalid_phone").catch(() => {});
+          sayQueue("לא הצלחתי לקלוט מספר תקין. אין בעיה—נסיים כאן. יום נעים.");
+          finishCall("invalid_phone", { skipClosing: true }).catch(() => {});
           return;
         }
-        sayQueue("כדי לחזור אליכם אני צריך מספר תקין של 9–10 ספרות. תגידו ספרה-ספרה בבקשה.");
+        sayQueue("כדי לחזור אליכם אני צריך מספר של 9–10 ספרות. תגידו ספרה-ספרה בבקשה.");
         return;
       }
 
@@ -1016,8 +954,7 @@ wss.on("connection", (twilioWs) => {
         input_audio_transcription: {
           model: "gpt-4o-mini-transcribe",
           language: ENV.MB_STT_LANGUAGE,
-          prompt:
-            "תמללו בעברית תקינה. מספרי טלפון בישראל מתחילים לרוב ב-0 (אפס).",
+          prompt: "תמללו בעברית תקינה. מספרי טלפון בישראל מתחילים לרוב ב-0 (אפס).",
         },
       },
     });
@@ -1027,7 +964,7 @@ wss.on("connection", (twilioWs) => {
       logInfo("[STATE] ASK_NAME | waiting user");
       armIdleTimers();
       armMaxCallTimers();
-      // אם awaitingOpeningConsent=true — לא שואלים עד תשובת המשתמש
+      // לא שואלים כלום לבד אחרי ה-start; מחכים לדיבור ראשון של הלקוח
     }, 120);
   });
 
@@ -1108,16 +1045,13 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
+      // אם אין פתיח בטוויליו ורוצים פתיח מהשרת (ENV) - נשאיר כפי שהיה
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
         sayQueue(ENV.MB_OPENING_TEXT);
       }
 
-      // אם הפתיח כבר התנגן בטוויליו ושאל הסכמה — מחכים לתשובת כן/לא
-      if (openingPlayedByTwilio) {
-        awaitingOpeningConsent = true;
-        c.meta.consent = "awaiting_opening";
-      }
-
+      // אין consent בכלל יותר
+      c.meta.consent = "skipped";
       return;
     }
 
