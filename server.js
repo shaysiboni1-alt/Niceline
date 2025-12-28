@@ -11,6 +11,10 @@
 // ✅ CONFIRM_NAME: לא מחלצים/מחליפים שם מתוך תלונות/משפטים.
 // ✅ מהירות דיבור: מינימום 1.08 תמיד.
 // ✅ הוובהוק והשדות נשארים כפי שהיו (לא נוגעים).
+//
+// PATCH (רק 2 דברים):
+// 1) הסרת "מעולה." משאלת השם
+// 2) הוספת "תודה, רשמתי." לפני הסגירה אחרי אישור 4 ספרות
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -643,7 +647,8 @@ wss.on("connection", (twilioWs) => {
 
   function askCurrentQuestionQueued() {
     if (state === STATES.ASK_NAME) {
-      sayQueue("מעולה. איך קוראים לכם? שם פרטי ושם משפחה בבקשה.");
+      // PATCH #1: הסרת "מעולה."
+      sayQueue("איך קוראים לכם? שם פרטי ושם משפחה בבקשה.");
       return;
     }
     if (state === STATES.CONFIRM_NAME) {
@@ -680,7 +685,6 @@ wss.on("connection", (twilioWs) => {
     if (!gotTwilioStart || !gotOpenAI) return;
 
     flowStarted = true;
-    // זריז אבל לא אגרסיבי מדי
     setTimeout(() => {
       logInfo("[FLOW] start -> ASK_NAME (proactive)");
       askCurrentQuestionQueued();
@@ -690,7 +694,27 @@ wss.on("connection", (twilioWs) => {
   }
 
   // ----- Name parsing -----
-  const NAME_TRASH = new Set(["הלו", "שלום", "היי", "כן", "לא", "אוקיי", "אוקי", "בסדר", "מי", "מה", "מה זה", "מי זה", "נו", "דבר", "לדבר", "תמשיך", "תמשיכו", "קדימה", "יאללה"]);
+  const NAME_TRASH = new Set([
+    "הלו",
+    "שלום",
+    "היי",
+    "כן",
+    "לא",
+    "אוקיי",
+    "אוקי",
+    "בסדר",
+    "מי",
+    "מה",
+    "מה זה",
+    "מי זה",
+    "נו",
+    "דבר",
+    "לדבר",
+    "תמשיך",
+    "תמשיכו",
+    "קדימה",
+    "יאללה",
+  ]);
   const NAME_BLOCK_PHRASES = [
     "תמללו בעברית תקינה",
     "מספרי טלפון בישראל",
@@ -704,7 +728,6 @@ wss.on("connection", (twilioWs) => {
     const n = normalizeText(t);
     if (!n) return true;
 
-    // סינון טרנסקריפט “מערכתי” (כמו אצלך בלוג)
     for (const p of NAME_BLOCK_PHRASES) {
       if (t.includes(p)) return true;
     }
@@ -716,7 +739,6 @@ wss.on("connection", (twilioWs) => {
     if (!t) return true;
     if (NAME_TRASH.has(t)) return true;
     if (t.length < 2) return true;
-    // אם זה ארוך בצורה חשודה לשם
     if (t.split(" ").length > 5) return true;
     return false;
   }
@@ -778,18 +800,20 @@ wss.on("connection", (twilioWs) => {
     c.finalTimer = setTimeout(async () => {
       await sendFinal(callSid, reason || "call_end");
       await hangupCall(callSid);
-      try { openaiWs.close(); } catch {}
-      try { twilioWs.close(); } catch {}
+      try {
+        openaiWs.close();
+      } catch {}
+      try {
+        twilioWs.close();
+      } catch {}
     }, endAfterMs);
   }
 
   function advanceAfter(userText) {
     const c = getCall(callSid);
 
-    // ✅ סינון “טרנסקריפט מזויף” כמו שהיה לך בלוג
     if (isGarbageTranscript(userText)) {
       if (ENV.MB_LOG_TRANSCRIPTS) logInfo("USER> (ignored garbage transcript)", userText);
-      // לא משנים סטייט ולא שומרים
       return;
     }
 
@@ -810,7 +834,6 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // אם המשתמש עדיין אומר "אוקיי/כן" כי התרגל — נשאל שוב את השם
     if (state === STATES.ASK_NAME) {
       const yn = detectYesNo(userText);
       const t = normalizeText(userText);
@@ -867,7 +890,6 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // קריטי: לא מחלצים שם מתוך משפט כאן
       sayQueue("רק לוודא—נכון? אפשר לענות כן או לא.");
       return;
     }
@@ -902,6 +924,10 @@ wss.on("connection", (twilioWs) => {
       if (yn === "yes") {
         c.lead.phone_number = callerPhoneLocal;
         logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (use caller)", { phone_number: callerPhoneLocal });
+
+        // PATCH #2: אישור קצר כדי שלא יישמע “נעצר”
+        sayQueue("תודה, רשמתי.");
+
         finishCall("completed_flow").catch(() => {});
         return;
       }
@@ -995,7 +1021,6 @@ wss.on("connection", (twilioWs) => {
         input_audio_transcription: {
           model: "gpt-4o-mini-transcribe",
           language: ENV.MB_STT_LANGUAGE,
-          // נשאיר את ה-prompt אבל נסנן אם הוא חוזר כטרנסקריפט (כבר טיפלנו בזה)
           prompt: "תמללו בעברית תקינה. מספרי טלפון בישראל מתחילים לרוב ב-0 (אפס).",
         },
       },
@@ -1088,16 +1113,12 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
-      // אם אין פתיח בטוויליו ורוצים פתיח מהשרת (ENV) - נשאיר כמו שהיה
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
-        // אם השרת מקריא פתיח – אז כדי לא לחפוף, נתחיל את השאלה אחרי הפתיח של השרת
         sayQueue(ENV.MB_OPENING_TEXT);
-        // ואז נתחיל פלואו
         setTimeout(() => {
           maybeStartFlow();
         }, 1200);
       } else {
-        // פתיח MP3 בטוויליו כבר הסתיים לפני start, אז אפשר להתחיל מיד
         maybeStartFlow();
       }
 
@@ -1121,7 +1142,9 @@ wss.on("connection", (twilioWs) => {
         await sendFinal(callSid, "twilio_stop");
       }
 
-      try { openaiWs.close(); } catch {}
+      try {
+        openaiWs.close();
+      } catch {}
       return;
     }
   });
@@ -1134,7 +1157,9 @@ wss.on("connection", (twilioWs) => {
         await sendFinal(callSid, "ws_close");
       }
     }
-    try { openaiWs.close(); } catch {}
+    try {
+      openaiWs.close();
+    } catch {}
   });
 
   twilioWs.on("error", (e) => logError("Twilio WS error", String(e?.message || e)));
