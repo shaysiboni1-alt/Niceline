@@ -78,6 +78,10 @@ const ENV = {
   ELEVENLABS_STABILITY: Number(process.env.ELEVENLABS_STABILITY || "0.5"),
   ELEVENLABS_STYLE: Number(process.env.ELEVENLABS_STYLE || "0.15"),
 };
+// Twilio Assets (recorded audio) for instant start/end (no TTS latency)
+const TWILIO_OPENING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/opening.mp3";
+const TWILIO_CLOSING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/closing.mp3";
+
 
 function logInfo(...args) {
   console.log("[INFO]", ...args);
@@ -227,6 +231,30 @@ async function hangupCall(callSid) {
   } catch (e) {
     return { ok: false, reason: "hangup_error", error: String(e?.message || e) };
   }
+async function playTwilioAsset(callSid, assetUrl) {
+  // Redirect the live call to TwiML that plays a Twilio Asset MP3, then hangs up.
+  // This is the most reliable way to avoid cut-offs and removes TTS latency for closing/opening.
+  if (!ENV.TWILIO_ACCOUNT_SID || !ENV.TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
+  if (!callSid || !assetUrl) return { ok: false, reason: "missing_params" };
+
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+  const twiml = `<Response><Play>${assetUrl}</Play><Hangup/></Response>`;
+  const body = new URLSearchParams({ Twiml: twiml });
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: twilioAuthHeader(), "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    const text = await res.text().catch(() => "");
+    return { ok: res.ok, status: res.status, body: text, reason: res.ok ? "twiml_redirect_ok" : "twiml_redirect_http_error" };
+  } catch (e) {
+    return { ok: false, reason: "twiml_redirect_error", error: String(e?.message || e) };
+  }
+}
+
+
 }
 
 // -------------------- Recording callback --------------------
@@ -679,7 +707,7 @@ if (!assertElevenConfigured()) {
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const last4 = last4Digits(callerPhoneLocal);
       if (last4) {
-        sayQueue(`המספר לחזרה מסתיים ב-${digitsSpaced(last4)}. זה נכון?`);
+        sayQueue(`המספר לחזרה מסתיים ב-${digitsSpaced(last4)}. נכון?`);
       } else {
         state = STATES.ASK_PHONE;
         askCurrentQuestionQueued();
@@ -802,22 +830,49 @@ if (!assertElevenConfigured()) {
     if (!callSid) return;
     const skipClosing = !!opts.skipClosing;
 
-    if (state !== STATES.DONE) {
+    // ✅ If we want a clean, instant, non-cutoff closing:
+    // Redirect Twilio call to play the recorded closing MP3, then hang up.
+    // We keep CRM/webhook logic unchanged and still send FINAL from here.
+    if (!skipClosing) {
+      // Mark DONE so we don't continue flow
       state = STATES.DONE;
-      if (!skipClosing) {
+
+      const r = await playTwilioAsset(callSid, TWILIO_CLOSING_MP3_URL);
+      if (!r.ok) {
+        // Fallback: if redirect fails, use existing TTS closing text
         const closing =
           ENV.MB_CLOSING_TEXT ||
           "תודה רבה, הפרטים נרשמו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
         sayQueue(closing);
+
+        endRequested = true;
+        endReason = reason || "completed_flow";
+        const minGrace = 6500;
+        endAfterMs = Math.max(minGrace, ENV.MB_HANGUP_GRACE_MS || 0);
+        tryDequeueSpeech().catch(() => {});
+        return;
       }
+
+      // Send FINAL after the closing audio should have finished, then close the WS.
+      // (Twilio will hang up via the redirected TwiML.)
+      setTimeout(async () => {
+        try {
+          await sendFinal(callSid, reason || "completed_flow");
+        } catch {}
+        try { twilioWs.close(); } catch {}
+      }, 4500);
+
+      return;
     }
+
+    // Skip closing path (refusal/timeouts): do a short deterministic close
+    if (state !== STATES.DONE) state = STATES.DONE;
 
     endRequested = true;
     endReason = reason || "completed_flow";
     const minGrace = 6500;
     endAfterMs = Math.max(minGrace, ENV.MB_HANGUP_GRACE_MS || 0);
 
-    // if nothing else queued, schedule end
     tryDequeueSpeech().catch(() => {});
   }
 
@@ -826,24 +881,8 @@ if (!assertElevenConfigured()) {
     const c = getCall(callSid);
     if (c.finalTimer) return;
 
-    // Wait for TTS to fully drain so closing won't be cut off.
-    async function waitForAudioDrain(maxMs = 6000) {
-      const start = Date.now();
-      while (Date.now() - start < maxMs) {
-        const ttsBusy = Boolean(ttsActive) || speechQueue.length > 0;
-        const audioBusy = (ulawOutQueue.length > 0) || (ulawOutBuffer && ulawOutBuffer.length > 0);
-        if (!ttsBusy && !audioBusy) return true;
-        await new Promise(r => setTimeout(r, 50));
-      }
-      return false;
-    }
-
     c.finalTimer = setTimeout(async () => {
-      // Give a chance to flush remaining audio frames
-      await waitForAudioDrain(6000);
       await sendFinal(callSid, reason || "call_end");
-      // Extra small grace to avoid tail cut
-      await new Promise(r => setTimeout(r, 300));
       await hangupCall(callSid);
       try { openaiWs.close(); } catch {}
       try { twilioWs.close(); } catch {}
@@ -985,7 +1024,7 @@ if (!assertElevenConfigured()) {
           sayQueue("אוקיי. תגידו שוב שם פרטי ושם משפחה.");
           return;
         }
-        sayQueue("רק כן או לא.");
+        sayQueue("כן או לא?");
         return;
       }
 
@@ -1004,7 +1043,7 @@ if (!assertElevenConfigured()) {
           askCurrentQuestionQueued();
           return;
         }
-        sayQueue("רק כן או לא.");
+        sayQueue("כן או לא?");
         return;
       }
 
@@ -1053,7 +1092,7 @@ if (!assertElevenConfigured()) {
           return;
         }
 
-        sayQueue("רק כן או לא.");
+        sayQueue("כן או לא?");
         return;
       }
 
@@ -1114,7 +1153,7 @@ if (!assertElevenConfigured()) {
       // After a short moment, start flow (we don't need to wait for user)
       setTimeout(() => {
         startFlowProactively();
-      }, 0);
+      }, 300);
 
       armIdleTimers();
       armMaxCallTimers();
@@ -1160,50 +1199,3 @@ if (!assertElevenConfigured()) {
 
 // -------------------- Health --------------------
 app.get("/", (req, res) => res.status(200).send("OK"));
-// -------------------- Eleven Warmup (reduce first-call latency) --------------------
-// We do a tiny TTS request and discard audio to keep ElevenLabs warm.
-// Runs on boot and then every 5 minutes. Does NOT affect webhook/flow.
-let elevenWarmedOnce = false;
-async function elevenWarmup() {
-  if (elevenWarmedOnce) return;
-  try {
-    if (!process.env.ELEVEN_API_KEY && !process.env.ELEVENLABS_API_KEY) return;
-    if (!process.env.ELEVEN_VOICE_ID) return;
-    // Lightweight non-stream endpoint to minimize work; discard result.
-    const apiKey = process.env.ELEVEN_API_KEY || process.env.ELEVENLABS_API_KEY;
-    const voiceId = process.env.ELEVEN_VOICE_ID;
-    const outputFormat = process.env.ELEVEN_OUTPUT_FORMAT || "ulaw_8000";
-    const modelId = process.env.ELEVEN_TTS_MODEL || process.env.ELEVENLABS_MODEL_ID || "eleven_v3";
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream?output_format=${encodeURIComponent(outputFormat)}`;
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "xi-api-key": apiKey,
-        "content-type": "application/json",
-        // We want ulaw bytes, not mp3.
-        "accept": "audio/ulaw",
-      },
-      body: JSON.stringify({
-        text: "שלום.",
-        model_id: modelId,
-        voice_settings: {
-          stability: Number(process.env.ELEVENLABS_STABILITY || "0.5"),
-          style: Number(process.env.ELEVENLABS_STYLE || "0.15"),
-        },
-      }),
-    });
-    // Consume a small amount then cancel.
-    if (resp.ok && resp.body) {
-      const reader = resp.body.getReader();
-      await reader.read().catch(() => {});
-      try { reader.cancel(); } catch {}
-    }
-    elevenWarmedOnce = true;
-  } catch (e) {
-    // Don't block boot
-  }
-}
-setTimeout(() => { elevenWarmup().catch(()=>{}); }, 50);
-setInterval(() => { elevenWarmedOnce = false; elevenWarmup().catch(()=>{}); }, 5 * 60 * 1000);
-
-
