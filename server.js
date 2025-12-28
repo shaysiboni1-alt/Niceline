@@ -12,9 +12,10 @@
 // ✅ מהירות דיבור: מינימום 1.08 תמיד.
 // ✅ הוובהוק והשדות נשארים כפי שהיו (לא נוגעים).
 //
-// PATCH (רק 2 דברים):
-// 1) הסרת "מעולה." משאלת השם
-// 2) הוספת "תודה, רשמתי." לפני הסגירה אחרי אישור 4 ספרות
+// PATCH (רק ניסוח שאלות + אישור קצר אחרי אישור מספר):
+// - שאלות קצרות יותר
+// - וידוא שם נשמע ברור
+// - אחרי "כן" על 4 ספרות: "רשמתי." ואז סגיר
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -546,7 +547,7 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_IDLE_WARNING_MS > 0) {
       if (idleWarnTimer) clearTimeout(idleWarnTimer);
       idleWarnTimer = setTimeout(() => {
-        sayQueue("רק לוודא שאתם איתנו—אפשר לענות לי רגע בבקשה?");
+        sayQueue("אתם איתנו? אפשר לענות רגע?");
         askCurrentQuestionQueued();
       }, ENV.MB_IDLE_WARNING_MS);
     }
@@ -562,7 +563,7 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_MAX_CALL_MS > 0 && ENV.MB_MAX_WARN_BEFORE_MS > 0) {
       const warnAt = Math.max(0, ENV.MB_MAX_CALL_MS - ENV.MB_MAX_WARN_BEFORE_MS);
       maxCallWarnTimer = setTimeout(() => {
-        sayQueue("רק עוד רגע קטן ואנחנו מסיימים—בואו נשלים את הפרטים וזהו.");
+        sayQueue("עוד רגע מסיימים—רק נשלים את הפרטים.");
         askCurrentQuestionQueued();
       }, warnAt);
     }
@@ -647,23 +648,22 @@ wss.on("connection", (twilioWs) => {
 
   function askCurrentQuestionQueued() {
     if (state === STATES.ASK_NAME) {
-      // PATCH #1: הסרת "מעולה."
-      sayQueue("איך קוראים לכם? שם פרטי ושם משפחה בבקשה.");
+      sayQueue("מה השם שלכם? שם פרטי ושם משפחה.");
       return;
     }
     if (state === STATES.CONFIRM_NAME) {
       const full = [pendingName.first, pendingName.last].filter(Boolean).join(" ");
-      sayQueue(`רשמתי: ${full}. נכון?`);
+      sayQueue(`רשמתי ${full}. נכון?`);
       return;
     }
     if (state === STATES.ASK_NAME_CORRECT) {
-      sayQueue("סבבה, איך נכון לרשום את השם? תגידו שוב שם פרטי ושם משפחה.");
+      sayQueue("איך נכון לרשום את השם? שם פרטי ושם משפחה.");
       return;
     }
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const last4 = last4Digits(callerPhoneLocal);
       if (last4) {
-        sayQueue(`רק לוודא—המספר לחזרה מסתיים ב-${digitsSpaced(last4)}. זה נכון?`);
+        sayQueue(`המספר לחזרה מסתיים ב-${digitsSpaced(last4)}. נכון?`);
       } else {
         state = STATES.ASK_PHONE;
         askCurrentQuestionQueued();
@@ -671,11 +671,11 @@ wss.on("connection", (twilioWs) => {
       return;
     }
     if (state === STATES.ASK_PHONE) {
-      sayQueue("מה מספר הטלפון הנכון לחזרה? אפשר להגיד ספרה-ספרה.");
+      sayQueue("מה מספר הטלפון לחזרה? תגידו ספרה-ספרה.");
       return;
     }
     if (state === STATES.CONFIRM_PHONE) {
-      sayQueue(`רק לוודא—המספר הוא ${digitsSpaced(pendingPhone)}. נכון?`);
+      sayQueue(`המספר הוא ${digitsSpaced(pendingPhone)}. נכון?`);
       return;
     }
   }
@@ -829,7 +829,7 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (isQuestionAboutDetails(userText)) {
-      sayQueue("מבין לגמרי. אני כאן רק לרישום קצר כדי שנציג יחזור אליכם—ממשיכים רגע.");
+      sayQueue("אני כאן רק לרישום קצר כדי שנציג יחזור אליכם. ממשיכים.");
       askCurrentQuestionQueued();
       return;
     }
@@ -849,11 +849,11 @@ wss.on("connection", (twilioWs) => {
       if (!nameObj) {
         retries.name += 1;
         if (retries.name >= 3) {
-          sayQueue("לא הצלחתי לקלוט שם ברור. אין בעיה—אפשר לנסות שוב בשיחה נוספת. יום נעים.");
+          sayQueue("לא הצלחתי לקלוט שם ברור. יום נעים.");
           finishCall("name_missing", { skipClosing: true }).catch(() => {});
           return;
         }
-        sayQueue("רק כדי להעביר את הפניה—תגידו לי שם פרטי ושם משפחה, בבקשה.");
+        sayQueue("תגידו שם פרטי ושם משפחה, בבקשה.");
         return;
       }
 
@@ -890,14 +890,14 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      sayQueue("רק לוודא—נכון? אפשר לענות כן או לא.");
+      sayQueue("נכון? כן או לא.");
       return;
     }
 
     if (state === STATES.ASK_NAME_CORRECT) {
       const nameObj = parseName(userText);
       if (!nameObj) {
-        sayQueue("סליחה, לא הצלחתי להבין. תגידו שוב שם פרטי ושם משפחה.");
+        sayQueue("לא הבנתי. תגידו שוב שם פרטי ושם משפחה.");
         return;
       }
       pendingName = nameObj;
@@ -916,7 +916,7 @@ wss.on("connection", (twilioWs) => {
 
         state = STATES.ASK_NAME_CORRECT;
         logInfo("[STATE] CONFIRM_CALLER_LAST4 -> ASK_NAME_CORRECT (name correction requested)");
-        sayQueue("בטח, נתקן רגע את השם כדי שיירשם נכון.");
+        sayQueue("בטח. נתקן את השם.");
         askCurrentQuestionQueued();
         return;
       }
@@ -925,8 +925,8 @@ wss.on("connection", (twilioWs) => {
         c.lead.phone_number = callerPhoneLocal;
         logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (use caller)", { phone_number: callerPhoneLocal });
 
-        // PATCH #2: אישור קצר כדי שלא יישמע “נעצר”
-        sayQueue("תודה, רשמתי.");
+        // אישור קצר כדי שהלקוח ישמע שנקלט "כן"
+        sayQueue("רשמתי.");
 
         finishCall("completed_flow").catch(() => {});
         return;
@@ -939,7 +939,7 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      sayQueue("רק כן או לא בבקשה—זה המספר הנכון לחזרה?");
+      sayQueue("זה המספר הנכון? כן או לא.");
       return;
     }
 
@@ -949,11 +949,11 @@ wss.on("connection", (twilioWs) => {
       if (!p || !isValidILPhoneDigits(p)) {
         retries.phone += 1;
         if (retries.phone >= 3) {
-          sayQueue("לא הצלחתי לקלוט מספר תקין. אין בעיה—נסיים כאן. יום נעים.");
+          sayQueue("לא הצלחתי לקלוט מספר תקין. יום נעים.");
           finishCall("invalid_phone", { skipClosing: true }).catch(() => {});
           return;
         }
-        sayQueue("כדי לחזור אליכם אני צריך מספר של 9–10 ספרות. תגידו ספרה-ספרה בבקשה.");
+        sayQueue("צריך 9–10 ספרות. תגידו ספרה-ספרה.");
         return;
       }
 
@@ -975,7 +975,7 @@ wss.on("connection", (twilioWs) => {
       if (yn === "no") {
         retries.confirmPhone += 1;
         if (retries.confirmPhone >= 2) {
-          sayQueue("סבבה. כדי שלא נטעה—בואו נרשום את המספר שוב.");
+          sayQueue("אוקיי. נרשום שוב.");
         }
         state = STATES.ASK_PHONE;
         askCurrentQuestionQueued();
@@ -989,7 +989,7 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      sayQueue("רק כן או לא בבקשה—זה המספר הנכון?");
+      sayQueue("זה המספר הנכון? כן או לא.");
       return;
     }
   }
