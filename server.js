@@ -711,7 +711,7 @@ if (!assertElevenConfigured()) {
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const last4 = last4Digits(callerPhoneLocal);
       if (last4) {
-        sayQueue(`אני מזהה שה־4 הַסְּפרוֹת האחרונות של מִסְפָּר הטלפון שלכם מסתיימות ב-${digitsSpaced(last4)}.`);
+        sayQueue(`אני מזהה שארבע הַסְּפרוֹת האחרונות של מִסְפָּר הטלפון שלכם מסתיימות ב-${digitsSpaced(last4)}.`);
         sayQueue("תרצו שנחזור למספר הזה, או למספר אחר?");
       } else {
         state = STATES.ASK_PHONE;
