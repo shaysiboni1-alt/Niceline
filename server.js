@@ -3,13 +3,12 @@
 // NiceLine / מרכז מל"מ – Voice AI (מוטי) – תסריט רישום
 // Twilio Media Streams <-> OpenAI Realtime API (WS) on Render
 //
-// CHANGES (כירורגי בלבד לטיפול בבאג הלוג):
-// A) אם opening_played=1 (הפתיח של Twilio כבר שאל "זה בסדר?") -> לשאול שם מיידית (לא להמתין).
-// B) לא לפרש "אמרתי כן/עניתי כן/אמר ... כן" כשם.
-// C) ב-CONFIRM_CALLER_LAST4: אם יש "כן, אבל תכתוב את השם" -> לא לסיים; לעבור לתיקון שם ואז לסיים.
-//
-// שינוי נוסף לפי בקשתך (כירורגי בלבד):
-// D) MB_SPEECH_SPEED ברירת־מחדל = 1.0 (במקום 0.95)
+// CHANGES (כירורגי בלבד לפי בקשת המשתמש):
+// 1) כשפתיח ה-MP3 כבר שאל "האם זה בסדר?" (opening_played=1) — לא לשאול שם מיד.
+//    מחכים לתשובת כן/לא. אם "לא" => מסיימים יפה בלי "נציג יחזור אליכם".
+//    אם "כן" => שואלים שם מיד.
+// 2) ניקוי פיסוק (כולל נקודה) מהשם הפרטי/משפחה.
+// 3) טונציה אנושית יותר בהנחיות response.create (בלי היימיש).
 //
 // כל היתר נשמר כפי שהיה.
 
@@ -46,9 +45,7 @@ const ENV = {
   MB_MAX_WARN_BEFORE_MS: Number(process.env.MB_MAX_WARN_BEFORE_MS || "30000"),
   MB_NO_BARGE_TAIL_MS: Number(process.env.MB_NO_BARGE_TAIL_MS || "1600"),
 
-  // D) default speed back to 1.0
-  MB_SPEECH_SPEED: Number(process.env.MB_SPEECH_SPEED || "1.0"),
-
+  MB_SPEECH_SPEED: Number(process.env.MB_SPEECH_SPEED || "0.95"),
   MB_STT_LANGUAGE: process.env.MB_STT_LANGUAGE || "he",
 
   MB_VAD_PREFIX_MS: Number(process.env.MB_VAD_PREFIX_MS || "200"),
@@ -516,9 +513,8 @@ wss.on("connection", (twilioWs) => {
   // (C) אם אישרו מספר ואז ביקשו לתקן שם, נסמן שהטלפון כבר סגור
   let phoneConfirmedFromCaller = false;
 
-  // (A) מנגנון "תשאל שם מיד" אם הפתיח כבר התנגן
-  let pendingImmediateAskName = false;
-  let askedNameOnce = false;
+  // (A) ניהול "הסכמה מהפתיח של טוויליו"
+  let awaitingOpeningConsent = false;
 
   function clearTimers() {
     if (idleWarnTimer) clearTimeout(idleWarnTimer);
@@ -533,7 +529,12 @@ wss.on("connection", (twilioWs) => {
       if (idleWarnTimer) clearTimeout(idleWarnTimer);
       idleWarnTimer = setTimeout(() => {
         sayQueue("רק לוודא שאתם איתנו. אשמח שתענו בבקשה.");
-        askCurrentQuestionQueued();
+        // אם עדיין מחכים להסכמה — נזכיר "כן/לא", אחרת נשאל את השאלה הנוכחית
+        if (awaitingOpeningConsent) {
+          sayQueue("רק כן או לא בבקשה — זה בסדר מבחינתכם?");
+        } else {
+          askCurrentQuestionQueued();
+        }
       }, ENV.MB_IDLE_WARNING_MS);
     }
     if (ENV.MB_IDLE_HANGUP_MS > 0) {
@@ -548,8 +549,9 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_MAX_CALL_MS > 0 && ENV.MB_MAX_WARN_BEFORE_MS > 0) {
       const warnAt = Math.max(0, ENV.MB_MAX_CALL_MS - ENV.MB_MAX_WARN_BEFORE_MS);
       maxCallWarnTimer = setTimeout(() => {
+        // נשאר כפי שהיה
         sayQueue("לפני שנסיים, אשמח רק להשלים את הפרטים כדי שיועץ יחזור אליכם.");
-        askCurrentQuestionQueued();
+        if (!awaitingOpeningConsent) askCurrentQuestionQueued();
       }, warnAt);
     }
     if (ENV.MB_MAX_CALL_MS > 0) {
@@ -623,7 +625,8 @@ wss.on("connection", (twilioWs) => {
       response: {
         instructions:
           `דברו בעברית תקינה, בלשון רבים בלבד.\n` +
-          `טון חם, אנושי, נעים ומרגיע, עם אינטונציה טבעית (לא רובוטי) וחיוך עדין.\n` +
+          // (3) טונציה אנושית יותר
+          `טון חם, אנושי ומאוד טבעי (לא רובוטי), עם אינטונציה משתנה בעדינות לפי המשפט.\n` +
           `קצב מעט יותר מהרגיל (סביב ${ENV.MB_SPEECH_SPEED}).\n` +
           `כשמקריאים מספרים/ספרות – להקריא ספרה-ספרה בצורה ברורה (למשל "0 5 0 ...").\n\n` +
           `הטקסט להקראה (להגיד בדיוק):\n${text}`,
@@ -633,7 +636,6 @@ wss.on("connection", (twilioWs) => {
 
   function askCurrentQuestionQueued() {
     if (state === STATES.ASK_NAME) {
-      askedNameOnce = true;
       sayQueue("מצוין. איך קוראים לכם? אפשר שם פרטי ושם משפחה.");
       return;
     }
@@ -676,8 +678,18 @@ wss.on("connection", (twilioWs) => {
     return false;
   }
 
+  // (2) ניקוי פיסוק מהשם (כולל נקודה) ושמירה על אותיות/ניקוד בלבד
+  function cleanHebrewName(raw) {
+    return (raw || "")
+      .toString()
+      .replace(/[0-9]/g, " ")
+      .replace(/[^\p{L}\p{M}\s]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function parseName(text) {
-    const raw = safeStr(text).replace(/[0-9]/g, "").replace(/\s+/g, " ").trim();
+    const raw = cleanHebrewName(text);
     if (!raw) return null;
     if (isTrashName(raw)) return null;
     // (B) הגנה: אם זה בעצם "אמרתי כן" וכד' — לא שם
@@ -694,15 +706,20 @@ wss.on("connection", (twilioWs) => {
     c.lead.last_name = nameObj.last || "";
   }
 
-  async function finishCall(reason) {
+  // שינוי כירורגי: מאפשר לסיים בלי CLOSING_TEXT במקרה סירוב מהפתיח
+  async function finishCall(reason, opts = {}) {
     if (!callSid) return;
+
+    const skipClosing = !!opts.skipClosing;
 
     if (state !== STATES.DONE) {
       state = STATES.DONE;
-      const closing =
-        ENV.MB_CLOSING_TEXT ||
-        "תודה רבה, הפרטים נשמרו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
-      sayQueue(closing);
+      if (!skipClosing) {
+        const closing =
+          ENV.MB_CLOSING_TEXT ||
+          "תודה רבה, הפרטים נשמרו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
+        sayQueue(closing);
+      }
     }
 
     endRequested = true;
@@ -734,6 +751,33 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_LOG_TRANSCRIPTS) logInfo("USER>", userText);
 
     armIdleTimers();
+
+    // (1) אם הפתיח של טוויליו שאל "זה בסדר?" — קודם מטפלים בהסכמה
+    if (awaitingOpeningConsent) {
+      const yn = detectYesNo(userText);
+
+      if (yn === "no" || isRefusal(userText)) {
+        c.meta.consent = "no";
+        // סגירה יפה בלי "נציג יחזור"
+        sayQueue("בסדר גמור. תודה רבה ויום נעים.");
+        awaitingOpeningConsent = false;
+        finishCall("user_refused_opening", { skipClosing: true }).catch(() => {});
+        return;
+      }
+
+      if (yn === "yes" || isOpeningYesPhrase(userText)) {
+        c.meta.consent = "yes";
+        awaitingOpeningConsent = false;
+        // ממשיכים מייד לשם
+        state = STATES.ASK_NAME;
+        askCurrentQuestionQueued();
+        return;
+      }
+
+      // לא ברור -> בקשה קצרה רק כן/לא
+      sayQueue("סליחה, רק כן או לא בבקשה — זה בסדר מבחינתכם?");
+      return;
+    }
 
     if (isRefusal(userText)) {
       c.meta.consent = "no";
@@ -972,12 +1016,7 @@ wss.on("connection", (twilioWs) => {
       logInfo("[STATE] ASK_NAME | waiting user");
       armIdleTimers();
       armMaxCallTimers();
-
-      // (A) אם הפתיח כבר התנגן בטוויליו — תשאל שם מיידית, פעם אחת בלבד
-      if (pendingImmediateAskName && !askedNameOnce) {
-        askCurrentQuestionQueued();
-        pendingImmediateAskName = false;
-      }
+      // אם awaitingOpeningConsent=true — לא שואלים כלום עד תשובת המשתמש
     }, 120);
   });
 
@@ -1062,13 +1101,10 @@ wss.on("connection", (twilioWs) => {
         sayQueue(ENV.MB_OPENING_TEXT);
       }
 
-      // (A) אם הפתיח כבר התנגן בטוויליו -> ברגע שהמודל מוכן נשאל שם
+      // (1) אם הפתיח כבר התנגן בטוויליו ושאל הסכמה — מחכים לתשובת כן/לא ולא אומרים "מצוין"
       if (openingPlayedByTwilio) {
-        pendingImmediateAskName = true;
-        if (openaiReady && !askedNameOnce) {
-          askCurrentQuestionQueued();
-          pendingImmediateAskName = false;
-        }
+        awaitingOpeningConsent = true;
+        c.meta.consent = "awaiting_opening";
       }
 
       return;
