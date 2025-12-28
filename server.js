@@ -643,7 +643,7 @@ wss.on("connection", (twilioWs) => {
 
   function askCurrentQuestionQueued() {
     if (state === STATES.ASK_NAME) {
-      sayQueue("מעולה. איך קוראים לכם? שם פרטי ושם משפחה בבקשה.");
+      sayQueue("איך קוראים לכם? שם פרטי ושם משפחה בבקשה");
       return;
     }
     if (state === STATES.CONFIRM_NAME) {
