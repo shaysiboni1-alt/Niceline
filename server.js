@@ -679,7 +679,7 @@ if (!assertElevenConfigured()) {
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const last4 = last4Digits(callerPhoneLocal);
       if (last4) {
-        sayQueue(`המספר לחזרה מסתיים ב-${digitsSpaced(last4)}. נכון?`);
+        sayQueue(`המספר לחזרה מסתיים ב-${digitsSpaced(last4)}. זה נכון?`);
       } else {
         state = STATES.ASK_PHONE;
         askCurrentQuestionQueued();
@@ -969,7 +969,7 @@ if (!assertElevenConfigured()) {
           sayQueue("אוקיי. תגידו שוב שם פרטי ושם משפחה.");
           return;
         }
-        sayQueue("כן או לא?");
+        sayQueue("רק כן או לא.");
         return;
       }
 
@@ -988,7 +988,7 @@ if (!assertElevenConfigured()) {
           askCurrentQuestionQueued();
           return;
         }
-        sayQueue("כן או לא?");
+        sayQueue("רק כן או לא.");
         return;
       }
 
@@ -1037,7 +1037,7 @@ if (!assertElevenConfigured()) {
           return;
         }
 
-        sayQueue("כן או לא?");
+        sayQueue("רק כן או לא.");
         return;
       }
 
