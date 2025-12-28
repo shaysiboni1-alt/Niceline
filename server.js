@@ -1141,19 +1141,24 @@ if (!assertElevenConfigured()) {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
-      // OPENING is always from Render now:
-      state = STATES.OPENING;
-      if (ENV.MB_OPENING_TEXT) {
-        sayQueue(ENV.MB_OPENING_TEXT);
+      // OPENING:
+// If Twilio already played opening.mp3 (opening_played=1), do NOT speak MB_OPENING_TEXT again.
+      if (openingPlayedByTwilio) {
+        state = STATES.ASK_NAME;
+        logInfo("[FLOW] start -> ASK_NAME (opening already played by Twilio)");
+        // Start immediately (stream starts only after Twilio <Play> finished)
+        setTimeout(() => startFlowProactively(), 0);
       } else {
-        // Minimal opening if ENV missing
-        sayQueue("שלום. אני נטע ממערכת הרישום של מרכז מל\"מ.");
+        state = STATES.OPENING;
+        if (ENV.MB_OPENING_TEXT) {
+          sayQueue(ENV.MB_OPENING_TEXT);
+        } else {
+          // Minimal opening if ENV missing
+          sayQueue("שלום. אני נטע ממערכת הרישום של מרכז מל\"מ.");
+        }
+        // Give the opening a moment to start; the Half-Duplex speech queue will prevent barge-in.
+        setTimeout(() => startFlowProactively(), 0);
       }
-
-      // After a short moment, start flow (we don't need to wait for user)
-      setTimeout(() => {
-        startFlowProactively();
-      }, 300);
 
       armIdleTimers();
       armMaxCallTimers();
