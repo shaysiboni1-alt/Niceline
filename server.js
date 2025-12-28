@@ -619,8 +619,7 @@ wss.on("connection", (twilioWs) => {
   }
 
   async function speakWithEleven(text) {
-(text) {
-    if (!assertElevenConfigured()) {
+if (!assertElevenConfigured()) {
       // Fail-safe: do nothing, but log
       logError("Eleven not configured (missing ELEVEN_API_KEY/ELEVEN_VOICE_ID)");
       return;
