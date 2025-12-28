@@ -231,9 +231,11 @@ async function hangupCall(callSid) {
   } catch (e) {
     return { ok: false, reason: "hangup_error", error: String(e?.message || e) };
   }
+}
+
 async function playTwilioAsset(callSid, assetUrl) {
-  // Redirect the live call to TwiML that plays a Twilio Asset MP3, then hangs up.
-  // This is the most reliable way to avoid cut-offs and removes TTS latency for closing/opening.
+  // Redirect the live call to TwiML that plays an MP3 asset, then hangs up.
+  // Used for recorded closing to eliminate TTS latency and avoid cut-offs.
   if (!ENV.TWILIO_ACCOUNT_SID || !ENV.TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
   if (!callSid || !assetUrl) return { ok: false, reason: "missing_params" };
 
@@ -252,9 +254,6 @@ async function playTwilioAsset(callSid, assetUrl) {
   } catch (e) {
     return { ok: false, reason: "twiml_redirect_error", error: String(e?.message || e) };
   }
-}
-
-
 }
 
 // -------------------- Recording callback --------------------
@@ -707,7 +706,8 @@ if (!assertElevenConfigured()) {
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const last4 = last4Digits(callerPhoneLocal);
       if (last4) {
-        sayQueue(`המספר לחזרה מסתיים ב-${digitsSpaced(last4)}. נכון?`);
+        sayQueue(`אני מזהה שה־4 הספרות האחרונות של המספר שלכם מסתיימות ב-${digitsSpaced(last4)}.`);
+        sayQueue("תרצו שנחזור למספר הזה, או למספר אחר?");
       } else {
         state = STATES.ASK_PHONE;
         askCurrentQuestionQueued();
@@ -812,7 +812,7 @@ if (!assertElevenConfigured()) {
       if (state === STATES.CONFIRM_NAME) return `רשמתי ${[pendingName.first,pendingName.last].filter(Boolean).join(" ")}. נכון?`;
       if (state === STATES.CONFIRM_CALLER_LAST4) {
         const last4 = last4Digits(callerPhoneLocal);
-        return last4 ? `המספר לחזרה מסתיים ב-${digitsSpaced(last4)}. נכון?` : "מה מספר הטלפון לחזרה? ספרה-ספרה.";
+        return last4 ? `אני מזהה שה־4 הספרות האחרונות של המספר שלכם מסתיימות ב-${digitsSpaced(last4)}. תרצו שנחזור למספר הזה, או למספר אחר?` : "מה מספר הטלפון לחזרה? ספרה-ספרה.";
       }
       if (state === STATES.ASK_PHONE) return "מה מספר הטלפון לחזרה? ספרה-ספרה.";
       if (state === STATES.CONFIRM_PHONE) return `המספר הוא ${digitsSpaced(pendingPhone)}. נכון?`;
@@ -1029,7 +1029,18 @@ if (!assertElevenConfigured()) {
       }
 
       if (state === STATES.CONFIRM_CALLER_LAST4) {
+        const t = normalizeText(transcript);
         const yn = detectYesNo(transcript);
+
+        const wantsOther =
+          yn === "no" ||
+          t.includes("מספר אחר") ||
+          t.includes("מספר חדש") ||
+          t.includes("אחר");
+
+        // If caller directly says a phone number, treat it as "number other"
+        const directPhone = extractPhoneFromTranscript(transcript);
+
         if (yn === "yes") {
           const c = getCall(callSid);
           c.lead.phone_number = callerPhoneLocal;
@@ -1037,13 +1048,24 @@ if (!assertElevenConfigured()) {
           await finishCall("completed_flow");
           return;
         }
-        if (yn === "no") {
+
+        if (directPhone && isValidILPhoneDigits(directPhone) && wantsOther) {
+          pendingPhone = directPhone;
+          state = STATES.CONFIRM_PHONE;
+          logInfo("[STATE] CONFIRM_CALLER_LAST4 -> CONFIRM_PHONE (provided new phone)", { phone_number: pendingPhone });
+          askCurrentQuestionQueued();
+          return;
+        }
+
+        if (wantsOther) {
           state = STATES.ASK_PHONE;
           logInfo("[STATE] CONFIRM_CALLER_LAST4 -> ASK_PHONE");
           askCurrentQuestionQueued();
           return;
         }
-        sayQueue("כן או לא?");
+
+        // Unclear answer: ask the choice again, briefly
+        sayQueue("זה המספר הזה, או מספר אחר?");
         return;
       }
 
