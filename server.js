@@ -12,6 +12,9 @@
 // 6) אימות שם + תיקון פעם אחת.
 // 7) לא משנים שמות ENV — משתמשים רק בקיימים אצלך.
 //
+// CHANGES NOW (כירורגי בלבד):
+// A) ביטול וובהוק שני: לא שולחים יותר recording_update בכלל (רק lead_final).
+// B) שיפור טון דיבור: יותר אנושי/חם + מעט יותר מהיר (דרך instructions בלבד).
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -211,7 +214,6 @@ function extractPhoneFromTranscript(text) {
   for (const tok of tokens) {
     if (HEB_DIGIT_WORDS.has(tok)) digits.push(HEB_DIGIT_WORDS.get(tok));
     else {
-      // לפעמים מודל מחזיר "חמש-אפס" או משהו דומה — ננסה לפרק
       const parts = tok.split(/[-_]/g).filter(Boolean);
       for (const p of parts) {
         if (HEB_DIGIT_WORDS.has(p)) digits.push(HEB_DIGIT_WORDS.get(p));
@@ -221,9 +223,7 @@ function extractPhoneFromTranscript(text) {
   const joined = digits.join("");
   if (joined.length >= 9 && joined.length <= 10) return joined;
 
-  // 3) אם יצא יותר ארוך, ננסה למצוא רצף 10/9 ספרות "הכי סביר" (לרוב מתחיל ב-0 בישראל)
   if (joined.length > 10) {
-    // נסה למצוא תת-רצף שמתחיל ב-0 ובאורך 10, אחרת 9
     for (let i = 0; i <= joined.length - 10; i++) {
       const sub = joined.slice(i, i + 10);
       if (sub.startsWith("0")) return sub;
@@ -356,6 +356,7 @@ function computeStatus(lead, consent) {
 }
 
 // -------------------- Recording callback --------------------
+// NOTE (כירורגי): לא שולחים יותר "recording_update" — רק שומרים נתוני הקלטה
 app.post("/twilio-recording-callback", async (req, res) => {
   const callSid = req.body?.CallSid || "";
   const recordingUrl = req.body?.RecordingUrl || "";
@@ -367,25 +368,7 @@ app.post("/twilio-recording-callback", async (req, res) => {
     const c = getCall(callSid);
     if (recordingSid) c.recordingSid = recordingSid;
     if (recordingUrl) c.recordingUrl = recordingUrl;
-
-    // אם כבר שלחנו FINAL ועדיין הגיע — update (כמו שהיה)
-    if (c.finalSent && (recordingUrl || recordingSid)) {
-      const origin = getPublicOrigin();
-      const publicRecording = recordingSid && origin ? `${origin}/recording/${recordingSid}.mp3` : "";
-
-      const payload = {
-        update_type: "recording_update",
-        callSid: c.callSid,
-        streamSid: c.streamSid,
-        caller_id: c.caller || "",
-        called: c.called || "",
-        recording_url: recordingUrl || "",
-        recording_public_url: publicRecording || "",
-        timestamp: nowIso(),
-      };
-      const r = await postJson(ENV.MAKE_WEBHOOK_URL, payload);
-      if (ENV.MB_LOG_CRM) logInfo("CRM> recording update result", r);
-    }
+    // ✅ אין שליחה ל-MAKE פה (בוטל הוובהוק השני)
   }
 
   res.status(200).send("OK");
@@ -398,7 +381,6 @@ app.get("/recording/:sid.mp3", async (req, res) => {
     if (!sid) return res.status(400).send("missing sid");
     if (!ENV.TWILIO_ACCOUNT_SID || !ENV.TWILIO_AUTH_TOKEN) return res.status(500).send("twilio auth missing");
 
-    // Twilio: Recording media is available via RecordingUrl + ".mp3"
     const url = `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Recordings/${sid}.mp3`;
 
     const r = await fetch(url, { headers: { Authorization: twilioAuthHeader() } });
@@ -408,7 +390,6 @@ app.get("/recording/:sid.mp3", async (req, res) => {
     }
 
     res.setHeader("Content-Type", "audio/mpeg");
-    // stream response
     const buf = Buffer.from(await r.arrayBuffer());
     res.status(200).send(buf);
   } catch (e) {
@@ -431,7 +412,6 @@ async function sendFinal(callSid, reason) {
   const c = getCall(callSid);
   if (c.finalSent) return;
 
-  // best effort: wait a bit for recording to arrive so it goes in lead_final
   if (ENV.MB_ENABLE_RECORDING) {
     await waitForRecording(callSid, 8000); // 8s
   }
@@ -457,7 +437,6 @@ async function sendFinal(callSid, reason) {
     call_status: status.label,
     call_status_code: status.code,
 
-    // original (protected) + public (no password)
     recording_url: c.recordingUrl || "",
     recording_public_url: publicRecording || "",
 
@@ -609,14 +588,15 @@ wss.on("connection", (twilioWs) => {
   }
 
   function createResponse(text) {
-    // פחות רובוטי + מהיר יותר + מבקש להקריא ספרות אחת-אחת
+    // (כירורגי): טון יותר אנושי + מעט יותר מהיר (ההנחיות לא נאמרות בשיחה)
     sendOpenAI({
       type: "response.create",
       response: {
         instructions:
-          `דברו בעברית תקינה, בלשון רבים בלבד. טון חם, אנושי, לא רובוטי, עם אינטונציה טבעית וחיוך קל.\n` +
-          `דברו מעט מהר מהרגיל (מהירות ~${ENV.MB_SPEECH_SPEED}).\n` +
-          `כשמקריאים מספרים/ספרות – הקפידו להקריא ספרה-ספרה בצורה ברורה (למשל "0 5 0 ...").\n\n` +
+          `דברו בעברית תקינה, בלשון רבים בלבד.\n` +
+          `טון חם, אנושי, נעים ומרגיע, עם אינטונציה טבעית (לא רובוטי) וחיוך עדין.\n` +
+          `קצב מעט יותר מהיר מהרגיל (סביב ${ENV.MB_SPEECH_SPEED}).\n` +
+          `כשמקריאים מספרים/ספרות – להקריא ספרה-ספרה בצורה ברורה (למשל "0 5 0 ...").\n\n` +
           `הטקסט להקראה (להגיד בדיוק):\n${text}`,
       },
     });
@@ -686,7 +666,6 @@ wss.on("connection", (twilioWs) => {
     c.lead.last_name = nameObj.last || "";
   }
 
-  // ✅ במקום לסגור מוקדם: אומרים סגיר ואז ניתוק אחרי GRACE מינימום
   async function finishCall(reason) {
     if (!callSid) return;
 
@@ -701,7 +680,6 @@ wss.on("connection", (twilioWs) => {
     endRequested = true;
     endReason = reason || "completed_flow";
 
-    // GRACE מינימום כדי שהסגיר יישמע
     const minGrace = 7000;
     endAfterMs = Math.max(minGrace, ENV.MB_HANGUP_GRACE_MS || 0);
 
@@ -772,7 +750,6 @@ wss.on("connection", (twilioWs) => {
       const nameObj = parseName(userText);
       if (!nameObj) {
         if (retries.name >= 1) {
-          // ממשיכים הלאה גם בלי שם
           state = callerPhoneLocal ? STATES.CONFIRM_CALLER_LAST4 : STATES.ASK_PHONE;
           logInfo("[STATE] ASK_NAME -> (no name) ->", state);
           askCurrentQuestionQueued();
@@ -801,7 +778,6 @@ wss.on("connection", (twilioWs) => {
       }
       if (yn === "no") {
         if (retries.nameConfirm >= 1) {
-          // אם לא הצלחנו לתקן – ממשיכים
           state = callerPhoneLocal ? STATES.CONFIRM_CALLER_LAST4 : STATES.ASK_PHONE;
           logInfo("[STATE] CONFIRM_NAME -> (unclear) ->", state);
           askCurrentQuestionQueued();
@@ -814,11 +790,10 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // אם אמר שם חדש במקום כן/לא – ננסה לפרש
       const nameObj = parseName(userText);
       if (nameObj) {
         pendingName = nameObj;
-        askCurrentQuestionQueued(); // ישאל שוב "רשמתי..."
+        askCurrentQuestionQueued();
         return;
       }
 
@@ -856,7 +831,6 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // אם הוא אמר מספר במקום כן/לא
       const p = extractPhoneFromTranscript(userText);
       if (p) {
         pendingPhone = p;
@@ -911,7 +885,6 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // אם אמר מספר אחר במקום כן/לא
       const p = extractPhoneFromTranscript(userText);
       if (p && isValidILPhoneDigits(p)) {
         pendingPhone = p;
@@ -1039,7 +1012,6 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
-      // אם Twilio לא ניגן פתיח — ננגן פתיח מה-ENV
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
         sayQueue(ENV.MB_OPENING_TEXT);
       }
