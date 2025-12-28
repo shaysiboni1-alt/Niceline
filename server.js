@@ -540,7 +540,8 @@ wss.on("connection", (twilioWs) => {
   };
 
   let state = STATES.OPENING;
-  let retries = { name: 0, phone: 0, confirmPhone: 0, offscript: 0 };
+  let callClosed = false;
+  let retries = { name: 0, phone: 0, confirmPhone: 0, offscript: 0, last4Choice: 0 };
 
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
@@ -579,12 +580,14 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_MAX_CALL_MS > 0 && ENV.MB_MAX_WARN_BEFORE_MS > 0) {
       const warnAt = Math.max(0, ENV.MB_MAX_CALL_MS - ENV.MB_MAX_WARN_BEFORE_MS);
       maxCallWarnTimer = setTimeout(() => {
+        if (callClosed) return;
         sayQueue("עוד רגע מסיימים.");
         askCurrentQuestionQueued();
       }, warnAt);
     }
     if (ENV.MB_MAX_CALL_MS > 0) {
       maxCallTimer = setTimeout(async () => {
+        if (callClosed) return;
         await finishCall("max_call_timeout");
       }, ENV.MB_MAX_CALL_MS);
     }
@@ -685,6 +688,7 @@ if (!assertElevenConfigured()) {
   }
 
   function sayQueue(text) {
+    if (callClosed) return;
     const t = safeStr(text);
     if (!t) return;
     botLog(t);
@@ -694,6 +698,7 @@ if (!assertElevenConfigured()) {
 
   // -------------------- FLOW Questions (short and strict) --------------------
   function askCurrentQuestionQueued() {
+    if (callClosed) return;
     if (state === STATES.ASK_NAME) {
       sayQueue("מה השם שלכם? שם פרטי ושם משפחה.");
       return;
@@ -828,6 +833,8 @@ if (!assertElevenConfigured()) {
   // -------------------- End / Closing --------------------
   async function finishCall(reason, opts = {}) {
     if (!callSid) return;
+    callClosed = true;
+    clearTimers();
     const skipClosing = !!opts.skipClosing;
 
     // ✅ If we want a clean, instant, non-cutoff closing:
@@ -1013,6 +1020,7 @@ if (!assertElevenConfigured()) {
           const c = getCall(callSid);
           c.lead.first_name = pendingName.first || "";
           c.lead.last_name = pendingName.last || "";
+          retries.last4Choice = 0;
           state = callerPhoneLocal ? STATES.CONFIRM_CALLER_LAST4 : STATES.ASK_PHONE;
           logInfo("[STATE] CONFIRM_NAME ->", state);
           askCurrentQuestionQueued();
@@ -1029,45 +1037,64 @@ if (!assertElevenConfigured()) {
       }
 
       if (state === STATES.CONFIRM_CALLER_LAST4) {
-        const t = normalizeText(transcript);
-        const yn = detectYesNo(transcript);
+  const tRaw = transcript || "";
+  const t = normalizeText(tRaw);
+  const yn = detectYesNo(tRaw);
 
-        const wantsOther =
-          yn === "no" ||
-          t.includes("מספר אחר") ||
-          t.includes("מספר חדש") ||
-          t.includes("אחר");
+  const saysOther =
+    yn === "no" ||
+    t.includes("מספר אחר") ||
+    t.includes("מספר חדש") ||
+    t.includes("חדש") ||
+    (t.includes("אחר") && !t.includes("האחרון"));
 
-        // If caller directly says a phone number, treat it as "number other"
-        const directPhone = extractPhoneFromTranscript(transcript);
+  const saysThis =
+    yn === "yes" ||
+    t.includes("למספר הזה") ||
+    t.includes("המספר הזה") ||
+    t.includes("לזה") ||
+    t === "זה" ||
+    t === "הזה" ||
+    (t.includes("זה") && !saysOther);
 
-        if (yn === "yes") {
-          const c = getCall(callSid);
-          c.lead.phone_number = callerPhoneLocal;
-          logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (use caller)", { phone_number: callerPhoneLocal });
-          await finishCall("completed_flow");
-          return;
-        }
+  // If caller directly says a phone number, treat it as "other number provided"
+  const directPhone = extractPhoneFromTranscript(tRaw);
 
-        if (directPhone && isValidILPhoneDigits(directPhone) && wantsOther) {
-          pendingPhone = directPhone;
-          state = STATES.CONFIRM_PHONE;
-          logInfo("[STATE] CONFIRM_CALLER_LAST4 -> CONFIRM_PHONE (provided new phone)", { phone_number: pendingPhone });
-          askCurrentQuestionQueued();
-          return;
-        }
+  if (saysThis) {
+    const c = getCall(callSid);
+    c.lead.phone_number = callerPhoneLocal;
+    logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (use caller)", { phone_number: callerPhoneLocal });
+    await finishCall("completed_flow");
+    return;
+  }
 
-        if (wantsOther) {
-          state = STATES.ASK_PHONE;
-          logInfo("[STATE] CONFIRM_CALLER_LAST4 -> ASK_PHONE");
-          askCurrentQuestionQueued();
-          return;
-        }
+  if (directPhone && isValidILPhoneDigits(directPhone)) {
+    pendingPhone = directPhone;
+    state = STATES.CONFIRM_PHONE;
+    logInfo("[STATE] CONFIRM_CALLER_LAST4 -> CONFIRM_PHONE (provided new phone)", { phone_number: pendingPhone });
+    askCurrentQuestionQueued();
+    return;
+  }
 
-        // Unclear answer: ask the choice again, briefly
-        sayQueue("זה המספר הזה, או מספר אחר?");
-        return;
-      }
+  if (saysOther) {
+    state = STATES.ASK_PHONE;
+    logInfo("[STATE] CONFIRM_CALLER_LAST4 -> ASK_PHONE");
+    askCurrentQuestionQueued();
+    return;
+  }
+
+  retries.last4Choice += 1;
+  if (retries.last4Choice >= 3) {
+    const c = getCall(callSid);
+    c.lead.phone_number = callerPhoneLocal;
+    logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (default use caller after retries)", { phone_number: callerPhoneLocal });
+    await finishCall("completed_flow");
+    return;
+  }
+
+  sayQueue("רק לבחור: המספר הזה, או מספר אחר?");
+  return;
+}
 
       if (state === STATES.ASK_PHONE) {
         const p = extractPhoneFromTranscript(transcript);
@@ -1167,7 +1194,8 @@ if (!assertElevenConfigured()) {
 // If Twilio already played opening.mp3 (opening_played=1), do NOT speak MB_OPENING_TEXT again.
       if (openingPlayedByTwilio) {
         state = STATES.ASK_NAME;
-        logInfo("[FLOW] start -> ASK_NAME (opening already played by Twilio)");
+        callClosed = false;
+      logInfo("[FLOW] start -> ASK_NAME (opening already played by Twilio)");
         // Start immediately (stream starts only after Twilio <Play> finished)
         setTimeout(() => startFlowProactively(), 0);
       } else {
@@ -1196,6 +1224,7 @@ if (!assertElevenConfigured()) {
     }
 
     if (data.event === "stop") {
+      callClosed = true;
       logInfo("Twilio stop", { streamSid, callSid });
       const c = getCall(callSid);
       c.endedAt = nowIso();
@@ -1211,6 +1240,7 @@ if (!assertElevenConfigured()) {
   });
 
   twilioWs.on("close", async () => {
+    callClosed = true;
     clearTimers();
     if (callSid) {
       const c = getCall(callSid);
