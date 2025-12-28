@@ -3,20 +3,12 @@
 // NiceLine / מרכז מל"מ – Voice AI (מוטי) – תסריט רישום
 // Twilio Media Streams <-> OpenAI Realtime API (WS) on Render
 //
-// FIXES (לפי הבקשות שלך):
-// 1) ספרות מוקראות אחת-אחת (last4 + מספרים) כדי שלא "יבלע" ספרות.
-// 2) Parser חזק לטלפון בעברית (גם "אפס חמש..." וכו') -> 9-10 ספרות.
-// 3) תמיד אומרים סגיר + GRACE מינימום לפני ניתוק.
-// 4) מחכים עד כמה שניות ל-recordingUrl לפני lead_final (best effort).
-// 5) לינק הקלטה ציבורי ללא סיסמה: /recording/:sid.mp3 (proxy).
-// 6) אימות שם + תיקון פעם אחת.
-// 7) לא משנים שמות ENV — משתמשים רק בקיימים אצלך.
+// CHANGES (כירורגי בלבד לטיפול בבאג הלוג):
+// A) אם opening_played=1 (הפתיח של Twilio כבר שאל "זה בסדר?") -> לשאול שם מיידית (לא להמתין).
+// B) לא לפרש "אמרתי כן/עניתי כן/אמר ... כן" כשם.
+// C) ב-CONFIRM_CALLER_LAST4: אם יש "כן, אבל תכתוב את השם" -> לא לסיים; לעבור לתיקון שם ואז לסיים.
 //
-// CHANGES NOW (כירורגי בלבד):
-// 1) ביטול וידוא "הסכמה": לא מנהלים state של ASK_CONSENT, לא שואלים "זה בסדר?"
-//    הפתיח כבר שאל בטוויליו. אם המשתמש מסרב ("לא רוצה/עזוב") בכל שלב -> סגירה.
-// 2) זיכרון אפליקטיבי: שמירת 50 שניות אחרונות של תמלולים (לוגיקה/דיבאג בלבד).
-// 3) חידוד STT לעברית רבנית/היימיש באמצעות prompt לתמלול (ללא שינוי ENV/ארכיטקטורה).
+// כל היתר נשמר כפי שהיה.
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -138,6 +130,30 @@ function isQuestionAboutDetails(text) {
   );
 }
 
+// (B) זיהוי "אמרתי כן/עניתי כן/אמר ... כן" כדי לא להיכנס לטעות שם
+function isOpeningYesPhrase(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  const hasYes = t.includes("כן") || t === "ok" || t === "okay";
+  const hasSaid = t.includes("אמרתי") || t.includes("עניתי") || t.includes("אמר") || t.includes("אמרתי לכם") || t.includes("אמרתי כן");
+  // דוגמאות שראינו: "אמר בי כן" (טעות STT) — נתפוס גם "אמר" + "כן"
+  return hasYes && (hasSaid || t.startsWith("אמר") || t.includes("אמר ") || t.includes("אמרתי "));
+}
+
+function wantsNameCorrection(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  return (
+    t.includes("שם") ||
+    t.includes("תכתוב") ||
+    t.includes("תרשום") ||
+    t.includes("תעתיק") ||
+    t.includes("תתקן") ||
+    t.includes("לא שמעת") ||
+    t.includes("לא הבנת")
+  );
+}
+
 // ---------- Public origin from PUBLIC_BASE_URL ----------
 function getPublicOrigin() {
   try {
@@ -206,11 +222,9 @@ const HEB_DIGIT_WORDS = new Map([
 ]);
 
 function extractPhoneFromTranscript(text) {
-  // 1) אם יש כבר ספרות בטקסט — נעדיף אותן
   const direct = digitsOnly(text);
   if (direct.length >= 9 && direct.length <= 10) return direct;
 
-  // 2) אחרת: ננסה לבנות ספרות ממילים
   const tokens = normalizeText(text).split(" ").filter(Boolean);
   const digits = [];
   for (const tok of tokens) {
@@ -235,7 +249,6 @@ function extractPhoneFromTranscript(text) {
       if (sub.startsWith("0")) return sub;
     }
   }
-
   return "";
 }
 
@@ -283,7 +296,7 @@ async function startRecordingIfEnabled(callSid) {
     return { ok: false, reason: "recording_env_missing" };
   }
 
-  const cbUrl = ENV.PUBLIC_BASE_URL; // already /twilio-recording-callback
+  const cbUrl = ENV.PUBLIC_BASE_URL;
   const url = `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
   const body = new URLSearchParams({
     RecordingStatusCallback: cbUrl,
@@ -340,8 +353,8 @@ function getCall(callSid) {
       recordingSid: "",
       recordingUrl: "",
       lead: { first_name: "", last_name: "", phone_number: "", study_track: "" },
-      meta: { consent: "assumed" }, // (כירורגי) ביטלנו אימות הסכמה; נשמר כ-assumed בלבד.
-      memory: { transcripts: [] },  // (כירורגי) זיכרון 50 שניות אחרונות
+      meta: { consent: "assumed" },
+      memory: { transcripts: [] },
       finalSent: false,
       finalTimer: null,
     });
@@ -353,7 +366,6 @@ function addTranscriptMemory(callSid, text) {
   const c = getCall(callSid);
   const now = Date.now();
   c.memory.transcripts.push({ ts: now, text: safeStr(text) });
-  // keep only last 50 seconds
   const cutoff = now - 50_000;
   c.memory.transcripts = c.memory.transcripts.filter((x) => x.ts >= cutoff && x.text);
 }
@@ -364,7 +376,6 @@ function computeStatus(lead) {
 }
 
 // -------------------- Recording callback --------------------
-// NOTE (כירורגי): לא שולחים יותר "recording_update" — רק שומרים נתוני הקלטה
 app.post("/twilio-recording-callback", async (req, res) => {
   const callSid = req.body?.CallSid || "";
   const recordingUrl = req.body?.RecordingUrl || "";
@@ -381,7 +392,7 @@ app.post("/twilio-recording-callback", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// -------------------- Public recording proxy (no password for client) --------------------
+// -------------------- Public recording proxy --------------------
 app.get("/recording/:sid.mp3", async (req, res) => {
   try {
     const sid = (req.params?.sid || "").trim();
@@ -404,7 +415,7 @@ app.get("/recording/:sid.mp3", async (req, res) => {
   }
 });
 
-// -------------------- Final send (best effort wait for recording) --------------------
+// -------------------- Final send --------------------
 async function waitForRecording(callSid, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -420,7 +431,7 @@ async function sendFinal(callSid, reason) {
   if (c.finalSent) return;
 
   if (ENV.MB_ENABLE_RECORDING) {
-    await waitForRecording(callSid, 8000); // 8s
+    await waitForRecording(callSid, 8000);
   }
 
   const status = computeStatus(c.lead);
@@ -491,12 +502,18 @@ wss.on("connection", (twilioWs) => {
     DONE: "DONE",
   };
 
-  // (כירורגי) ביטלנו ASK_CONSENT — מתחילים ישר מהשם
   let state = STATES.ASK_NAME;
 
   const retries = { name: 0, nameConfirm: 0, phone: 0, confirmPhone: 0 };
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
+
+  // (C) אם אישרו מספר ואז ביקשו לתקן שם, נסמן שהטלפון כבר סגור
+  let phoneConfirmedFromCaller = false;
+
+  // (A) מנגנון "תשאל שם מיד" אם הפתיח כבר התנגן
+  let pendingImmediateAskName = false;
+  let askedNameOnce = false;
 
   function clearTimers() {
     if (idleWarnTimer) clearTimeout(idleWarnTimer);
@@ -602,7 +619,7 @@ wss.on("connection", (twilioWs) => {
         instructions:
           `דברו בעברית תקינה, בלשון רבים בלבד.\n` +
           `טון חם, אנושי, נעים ומרגיע, עם אינטונציה טבעית (לא רובוטי) וחיוך עדין.\n` +
-          `קצב מעט יותר מהיר מהרגיל (סביב ${ENV.MB_SPEECH_SPEED}).\n` +
+          `קצב מעט יותר מהרגיל (סביב ${ENV.MB_SPEECH_SPEED}).\n` +
           `כשמקריאים מספרים/ספרות – להקריא ספרה-ספרה בצורה ברורה (למשל "0 5 0 ...").\n\n` +
           `הטקסט להקראה (להגיד בדיוק):\n${text}`,
       },
@@ -611,6 +628,7 @@ wss.on("connection", (twilioWs) => {
 
   function askCurrentQuestionQueued() {
     if (state === STATES.ASK_NAME) {
+      askedNameOnce = true;
       sayQueue("מצוין. איך קוראים לכם? אפשר שם פרטי ושם משפחה.");
       return;
     }
@@ -657,6 +675,8 @@ wss.on("connection", (twilioWs) => {
     const raw = safeStr(text).replace(/[0-9]/g, "").replace(/\s+/g, " ").trim();
     if (!raw) return null;
     if (isTrashName(raw)) return null;
+    // (B) הגנה: אם זה בעצם "אמרתי כן" וכד' — לא שם
+    if (isOpeningYesPhrase(raw)) return null;
 
     const parts = raw.split(" ").filter(Boolean);
     if (parts.length === 1) return { first: parts[0], last: "" };
@@ -705,14 +725,11 @@ wss.on("connection", (twilioWs) => {
   function advanceAfter(userText) {
     const c = getCall(callSid);
 
-    // (כירורגי) זיכרון 50 שניות תמלולים
     addTranscriptMemory(callSid, userText);
-
     if (ENV.MB_LOG_TRANSCRIPTS) logInfo("USER>", userText);
 
     armIdleTimers();
 
-    // סירוב בכל שלב
     if (isRefusal(userText)) {
       c.meta.consent = "no";
       sayQueue("בסדר גמור, תודה רבה ויום נעים.");
@@ -720,7 +737,6 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // שאלות על פרטים/קורסים וכו' -> תשובה קצרה וסיום (כמו שהיה)
     if (isQuestionAboutDetails(userText)) {
       sayQueue(
         "זו שאלה חשובה, ויועץ לימודים ישמח להסביר לכם את כל הפרטים בצורה מדויקת ומותאמת אישית. אני כאן רק כדי להעביר את הפניה, והוא יחזור אליכם בהקדם."
@@ -729,11 +745,12 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // (כירורגי) אם אחרי הפתיח ענו רק "כן/בסדר" — לא נחשיב ככישלון שם, פשוט נמשיך לשאלת השם
+    // אם המשתמש רק "אישר פתיח" (כולל ניסוחים כמו "אמרתי כן") — לשאול שם מיד.
     if (state === STATES.ASK_NAME) {
       const yn = detectYesNo(userText);
       const t = normalizeText(userText);
-      if (yn === "yes" && t.length <= 8) {
+
+      if ((yn === "yes" && t.length <= 12) || isOpeningYesPhrase(userText)) {
         askCurrentQuestionQueued();
         return;
       }
@@ -764,6 +781,14 @@ wss.on("connection", (twilioWs) => {
       const yn = detectYesNo(userText);
       if (yn === "yes") {
         saveNameToLead(pendingName);
+
+        // אם כבר אישרו טלפון קודם (בתרחיש תיקון שם אחרי מספר) — סיום
+        if (phoneConfirmedFromCaller) {
+          logInfo("[STATE] CONFIRM_NAME -> DONE (phone already confirmed)");
+          finishCall("completed_flow").catch(() => {});
+          return;
+        }
+
         state = callerPhoneLocal ? STATES.CONFIRM_CALLER_LAST4 : STATES.ASK_PHONE;
         logInfo("[STATE] CONFIRM_NAME ->", state);
         askCurrentQuestionQueued();
@@ -809,6 +834,20 @@ wss.on("connection", (twilioWs) => {
 
     if (state === STATES.CONFIRM_CALLER_LAST4) {
       const yn = detectYesNo(userText);
+      const t = normalizeText(userText);
+
+      // (C) אם אמרו "כן" אבל גם מבקשים תיקון שם — לעבור לתיקון שם, לא לסיים
+      if (yn === "yes" && wantsNameCorrection(userText)) {
+        // שומרים טלפון caller, אבל לא מסיימים לפני תיקון השם
+        c.lead.phone_number = callerPhoneLocal;
+        phoneConfirmedFromCaller = true;
+
+        state = STATES.ASK_NAME_CORRECT;
+        logInfo("[STATE] CONFIRM_CALLER_LAST4 -> ASK_NAME_CORRECT (name correction requested)");
+        sayQueue("בטח. בואו נתקן את השם כדי שיירשם נכון.");
+        askCurrentQuestionQueued();
+        return;
+      }
 
       if (yn === "yes") {
         c.lead.phone_number = callerPhoneLocal;
@@ -916,7 +955,6 @@ wss.on("connection", (twilioWs) => {
         input_audio_transcription: {
           model: "gpt-4o-mini-transcribe",
           language: ENV.MB_STT_LANGUAGE,
-          // (כירורגי) חיזוק תמלול לעברית "רבנית/היימיש" + מונחים נפוצים
           prompt:
             "תמללו בעברית תקינה. העדיפו כתיב עברי למונחים ומילים רבניות/היימיש. " +
             "דוגמאות מונחים: רב, רבנות, דיינות, טוען רבני, בית דין, ברכה, קמע, בעזרת השם, בלי עין הרע, ברוך השם, אמן. " +
@@ -926,19 +964,17 @@ wss.on("connection", (twilioWs) => {
     });
 
     setTimeout(() => {
-      // (כירורגי) מתחילים ישר מהשם, לא מהסכמה
       state = STATES.ASK_NAME;
       logInfo("[STATE] ASK_NAME | waiting user");
       armIdleTimers();
       armMaxCallTimers();
 
-      // לא שואלים מיד אם הפתיח כבר רץ — נחכה לתשובת הלקוח ואז נתקדם (כמו עובד היום)
-      // אם אין פתיח בטוויליו, נשאל שם דרך MB_OPENING_TEXT (לפי הקיים)
-      if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
-        // אם אין פתיח טוויליו, הקוד הקיים מקריא פתיח טקסטואלי; נשאיר כרגיל
-        // (הפתיח נשאר, אבל אין "וידוא הסכמה" אצלנו)
+      // (A) אם הפתיח כבר התנגן בטוויליו — תשאל שם מיידית, פעם אחת בלבד
+      if (pendingImmediateAskName && !askedNameOnce) {
+        askCurrentQuestionQueued();
+        pendingImmediateAskName = false;
       }
-    }, 200);
+    }, 120);
   });
 
   openaiWs.on("message", (data) => {
@@ -1020,6 +1056,15 @@ wss.on("connection", (twilioWs) => {
 
       if (!openingPlayedByTwilio && ENV.MB_OPENING_TEXT) {
         sayQueue(ENV.MB_OPENING_TEXT);
+      }
+
+      // (A) אם הפתיח כבר התנגן בטוויליו -> ברגע שהמודל מוכן נשאל שם
+      if (openingPlayedByTwilio) {
+        pendingImmediateAskName = true;
+        if (openaiReady && !askedNameOnce) {
+          askCurrentQuestionQueued();
+          pendingImmediateAskName = false;
+        }
       }
 
       return;
