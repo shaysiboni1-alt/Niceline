@@ -826,8 +826,24 @@ if (!assertElevenConfigured()) {
     const c = getCall(callSid);
     if (c.finalTimer) return;
 
+    // Wait for TTS to fully drain so closing won't be cut off.
+    async function waitForAudioDrain(maxMs = 6000) {
+      const start = Date.now();
+      while (Date.now() - start < maxMs) {
+        const ttsBusy = Boolean(ttsActive) || speechQueue.length > 0;
+        const audioBusy = (ulawOutQueue.length > 0) || (ulawOutBuffer && ulawOutBuffer.length > 0);
+        if (!ttsBusy && !audioBusy) return true;
+        await new Promise(r => setTimeout(r, 50));
+      }
+      return false;
+    }
+
     c.finalTimer = setTimeout(async () => {
+      // Give a chance to flush remaining audio frames
+      await waitForAudioDrain(6000);
       await sendFinal(callSid, reason || "call_end");
+      // Extra small grace to avoid tail cut
+      await new Promise(r => setTimeout(r, 300));
       await hangupCall(callSid);
       try { openaiWs.close(); } catch {}
       try { twilioWs.close(); } catch {}
@@ -1098,7 +1114,7 @@ if (!assertElevenConfigured()) {
       // After a short moment, start flow (we don't need to wait for user)
       setTimeout(() => {
         startFlowProactively();
-      }, 300);
+      }, 0);
 
       armIdleTimers();
       armMaxCallTimers();
@@ -1144,3 +1160,50 @@ if (!assertElevenConfigured()) {
 
 // -------------------- Health --------------------
 app.get("/", (req, res) => res.status(200).send("OK"));
+// -------------------- Eleven Warmup (reduce first-call latency) --------------------
+// We do a tiny TTS request and discard audio to keep ElevenLabs warm.
+// Runs on boot and then every 5 minutes. Does NOT affect webhook/flow.
+let elevenWarmedOnce = false;
+async function elevenWarmup() {
+  if (elevenWarmedOnce) return;
+  try {
+    if (!process.env.ELEVEN_API_KEY && !process.env.ELEVENLABS_API_KEY) return;
+    if (!process.env.ELEVEN_VOICE_ID) return;
+    // Lightweight non-stream endpoint to minimize work; discard result.
+    const apiKey = process.env.ELEVEN_API_KEY || process.env.ELEVENLABS_API_KEY;
+    const voiceId = process.env.ELEVEN_VOICE_ID;
+    const outputFormat = process.env.ELEVEN_OUTPUT_FORMAT || "ulaw_8000";
+    const modelId = process.env.ELEVEN_TTS_MODEL || process.env.ELEVENLABS_MODEL_ID || "eleven_v3";
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream?output_format=${encodeURIComponent(outputFormat)}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "content-type": "application/json",
+        // We want ulaw bytes, not mp3.
+        "accept": "audio/ulaw",
+      },
+      body: JSON.stringify({
+        text: "שלום.",
+        model_id: modelId,
+        voice_settings: {
+          stability: Number(process.env.ELEVENLABS_STABILITY || "0.5"),
+          style: Number(process.env.ELEVENLABS_STYLE || "0.15"),
+        },
+      }),
+    });
+    // Consume a small amount then cancel.
+    if (resp.ok && resp.body) {
+      const reader = resp.body.getReader();
+      await reader.read().catch(() => {});
+      try { reader.cancel(); } catch {}
+    }
+    elevenWarmedOnce = true;
+  } catch (e) {
+    // Don't block boot
+  }
+}
+setTimeout(() => { elevenWarmup().catch(()=>{}); }, 50);
+setInterval(() => { elevenWarmedOnce = false; elevenWarmup().catch(()=>{}); }, 5 * 60 * 1000);
+
+
