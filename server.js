@@ -113,6 +113,13 @@ function digitsSpaced(d) {
   const x = digitsOnly(d);
   return x.split("").join(" ");
 }
+function phoneForSpeech(d) {
+  // ✅ change ONLY for readback quality: speak in groups (prevents missing digits in TTS)
+  const x = digitsOnly(d);
+  if (x.length === 10) return `${x.slice(0, 3)} ${x.slice(3, 6)} ${x.slice(6)}`; // 050 322 2237
+  if (x.length === 9) return `${x.slice(0, 2)} ${x.slice(2, 5)} ${x.slice(5)}`;  // 03 123 4567
+  return x;
+}
 function last4Digits(d) {
   const x = digitsOnly(d);
   if (x.length < 4) return "";
@@ -190,7 +197,6 @@ async function startRecordingIfEnabled(callSid) {
     return { ok: false, reason: "recording_env_missing" };
   }
 
-  // This endpoint should already exist in your current stack (PUBLIC_BASE_URL points to /twilio-recording-callback)
   const cbUrl = ENV.PUBLIC_BASE_URL;
   const url = `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Calls/${callSid}/Recordings.json`;
   const body = new URLSearchParams({
@@ -233,8 +239,6 @@ async function hangupCall(callSid) {
 }
 
 async function playTwilioAsset(callSid, assetUrl) {
-  // Redirect the live call to TwiML that plays an MP3 asset, then hangs up.
-  // Used for recorded closing to eliminate TTS latency and avoid cut-offs.
   if (!ENV.TWILIO_ACCOUNT_SID || !ENV.TWILIO_AUTH_TOKEN) return { ok: false, reason: "twilio_auth_missing" };
   if (!callSid || !assetUrl) return { ok: false, reason: "missing_params" };
 
@@ -686,12 +690,12 @@ wss.on("connection", (twilioWs) => {
       return;
     }
     if (state === STATES.ASK_PHONE) {
-      // ✅ שינוי יחיד כאן: בלי "ספרה-ספרה"
       sayQueue("מה מספר הטלפון לחזרה?");
       return;
     }
     if (state === STATES.CONFIRM_PHONE) {
-      sayQueue(`המספר הוא ${digitsSpaced(pendingPhone)}. נכון?`);
+      // ✅ change ONLY: read phone in grouped format (not digit-by-digit)
+      sayQueue(`המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`);
       return;
     }
   }
@@ -797,7 +801,7 @@ wss.on("connection", (twilioWs) => {
     const questionTextForState = (() => {
       if (state === STATES.ASK_NAME) return "מה השם המלא שלכם?";
       if (state === STATES.ASK_PHONE) return "מה מספר הטלפון לחזרה?";
-      if (state === STATES.CONFIRM_PHONE) return `המספר הוא ${digitsSpaced(pendingPhone)}. נכון?`;
+      if (state === STATES.CONFIRM_PHONE) return `המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`; // ✅ grouped
       return "אפשר לענות רגע?";
     })();
 
@@ -995,7 +999,6 @@ wss.on("connection", (twilioWs) => {
             await finishCall("invalid_phone", { skipClosing: true });
             return;
           }
-          // ✅ שינוי יחיד כאן: בלי הסברים (ספרה-ספרה / 9–10 ספרות)
           sayQueue("לא קלטתי. אפשר לחזור על מספר הטלפון לחזרה?");
           return;
         }
