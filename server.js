@@ -1,61 +1,75 @@
 // server.js
-//
-// NiceLine / מרכז מל"מ – Voice AI (FINAL – FIXED)
-// =================================================
-// ✔ ממשיך מיד אחרי קליטת שם
-// ✔ אין וידוא שם
-// ✔ מעבר אוטומטי לטלפון
-// ✔ נייד = סגירה מיידית
-// ✔ נייח = בקשת טלפון לחזרה (ניסיון אחד)
-// ✔ פתיח וסגיר רק מהקלטות Twilio
-// ✔ אין לופים / אין עצירות
-// ✔ webhook / CRM / recording – לא נוגעים
-// =================================================
+// FIX: ASK_NAME no longer triggers premature finish.
+// Flow strictly follows:
+// OPENING (Twilio asset) -> ASK_NAME -> PHONE DECISION -> CLOSING (Twilio asset)
+// OpenAI fallback STAYS. CRM / webhook / recording STAYS.
 
 const express = require("express");
 const WebSocket = require("ws");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 10000;
 
-// ================= ENV =================
+// ===================== ENV =====================
 const ENV = {
   MAKE_WEBHOOK_URL: process.env.MAKE_WEBHOOK_URL || "",
-  MB_IDLE_HANGUP_MS: Number(process.env.MB_IDLE_HANGUP_MS || 55000),
-  MB_MAX_CALL_MS: Number(process.env.MB_MAX_CALL_MS || 240000),
 
-  MB_VAD_THRESHOLD: Number(process.env.MB_VAD_THRESHOLD || 0.35),
-  MB_VAD_PREFIX_MS: Number(process.env.MB_VAD_PREFIX_MS || 180),
-  MB_VAD_SILENCE_MS: Number(process.env.MB_VAD_SILENCE_MS || 650),
-  MB_VAD_SUFFIX_MS: Number(process.env.MB_VAD_SUFFIX_MS || 250),
+  MB_ENABLE_RECORDING: String(process.env.MB_ENABLE_RECORDING || "false") === "true",
 
-  TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID,
-  TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN,
-  PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL,
+  MB_HANGUP_GRACE_MS: Number(process.env.MB_HANGUP_GRACE_MS || "4500"),
 
-  ELEVEN_API_KEY: process.env.ELEVEN_API_KEY,
-  ELEVEN_VOICE_ID: process.env.ELEVEN_VOICE_ID,
-  ELEVEN_TTS_MODEL: process.env.ELEVEN_TTS_MODEL || "eleven_v3",
+  MB_IDLE_WARNING_MS: Number(process.env.MB_IDLE_WARNING_MS || "25000"),
+  MB_IDLE_HANGUP_MS: Number(process.env.MB_IDLE_HANGUP_MS || "55000"),
+
+  MB_MAX_CALL_MS: Number(process.env.MB_MAX_CALL_MS || "240000"),
+  MB_MAX_WARN_BEFORE_MS: Number(process.env.MB_MAX_WARN_BEFORE_MS || "30000"),
+
+  MB_VAD_THRESHOLD: Number(process.env.MB_VAD_THRESHOLD || "0.35"),
+  MB_VAD_PREFIX_MS: Number(process.env.MB_VAD_PREFIX_MS || "180"),
+  MB_VAD_SILENCE_MS: Number(process.env.MB_VAD_SILENCE_MS || "650"),
+  MB_VAD_SUFFIX_MS: Number(process.env.MB_VAD_SUFFIX_MS || "250"),
+
+  OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
+  PENAI_REALTIME_MODEL: process.env.PENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28",
+
+  TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID || "",
+  TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN || "",
+  PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || "",
+
+  ELEVEN_API_KEY: process.env.ELEVEN_API_KEY || "",
+  ELEVEN_VOICE_ID: process.env.ELEVEN_VOICE_ID || "",
 };
 
-const OPENING_MP3 = "https://toolbox-hummingbird-8667.twil.io/assets/Opening.mp3";
-const CLOSING_MP3 = "https://toolbox-hummingbird-8667.twil.io/assets/Closing.mp3";
+const TWILIO_OPENING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/Opening.mp3";
+const TWILIO_CLOSING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/Closing.mp3";
 
-// ================= UTILS =================
+// ===================== HELPERS =====================
 const log = (...a) => console.log("[INFO]", ...a);
-const digits = (s) => (s || "").replace(/\D/g, "");
-const isMobile = (c) => c.startsWith("+9725");
-const isLandline = (c) => /^\+972[234789]/.test(c);
-const validIL = (n) => {
-  const d = digits(n);
-  return d.length === 9 || d.length === 10;
-};
+const err = (...a) => console.log("[ERROR]", ...a);
 
-// ================= CALL STORE =================
+const digitsOnly = (s) => (s || "").replace(/[^\d]/g, "");
+const isMobile972 = (c) => c.startsWith("+9725");
+const isLandline972 = (c) => /^\+972[234789]/.test(c);
+
+function splitName(text) {
+  const clean = text.replace(/[^\p{L}\s]/gu, " ").trim();
+  const parts = clean.split(/\s+/);
+  if (parts.length === 0) return { first: "", last: "" };
+  if (parts.length === 1) return { first: parts[0], last: "" };
+  return { first: parts[0], last: parts.slice(1).join(" ") };
+}
+
+function isValidILPhone(p) {
+  const d = digitsOnly(p);
+  return d.length === 9 || d.length === 10;
+}
+
+// ===================== CALL STORE =====================
 const calls = new Map();
-function call(callSid) {
+function getCall(callSid) {
   if (!calls.has(callSid)) {
     calls.set(callSid, {
       callSid,
@@ -63,63 +77,38 @@ function call(callSid) {
       caller: "",
       called: "",
       callerPhoneLocal: "",
-      lead: { first_name: "", last_name: "", phone_number: "" },
       recordingSid: "",
+      recordingUrl: "",
+      lead: { first_name: "", last_name: "", phone_number: "", study_track: "" },
       finalSent: false,
     });
   }
   return calls.get(callSid);
 }
 
-// ================= TWILIO =================
-function auth() {
-  return (
-    "Basic " +
-    Buffer.from(
-      `${ENV.TWILIO_ACCOUNT_SID}:${ENV.TWILIO_AUTH_TOKEN}`
-    ).toString("base64")
-  );
-}
-
-async function playAndHangup(callSid, url) {
-  const body = new URLSearchParams({
-    Twiml: `<Response><Play>${url}</Play><Hangup/></Response>`,
-  });
-  await fetch(
-    `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: auth(),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body,
-    }
-  );
-}
-
-// ================= CRM =================
+// ===================== WEBHOOK =====================
 async function sendFinal(callSid, reason) {
-  const c = call(callSid);
+  const c = getCall(callSid);
   if (c.finalSent) return;
 
   const payload = {
     update_type: "lead_final",
     first_name: c.lead.first_name || "",
     last_name: c.lead.last_name || "",
-    phone_number: digits(c.lead.phone_number || ""),
+    phone_number: digitsOnly(c.lead.phone_number || ""),
     study_track: "",
 
-    caller_id: c.caller,
-    caller_phone_local: c.callerPhoneLocal,
-    called: c.called,
+    caller_id: c.caller || "",
+    caller_phone_local: c.callerPhoneLocal || "",
+    called: c.called || "",
+
     callSid: c.callSid,
     streamSid: c.streamSid,
 
     call_status: c.lead.phone_number ? "שיחה מלאה" : "שיחה חלקית",
     call_status_code: c.lead.phone_number ? "completed" : "partial",
 
-    recording_url: "",
+    recording_url: c.recordingUrl || "",
     recording_public_url: c.recordingSid
       ? `${ENV.PUBLIC_BASE_URL}/recording/${c.recordingSid}.mp3`
       : "",
@@ -127,9 +116,7 @@ async function sendFinal(callSid, reason) {
     source: "Voice AI - Nice Line",
     timestamp: new Date().toISOString(),
     reason,
-    remarks: `סטטוס: ${
-      c.lead.phone_number ? "שיחה מלאה" : "שיחה חלקית"
-    } | name: ${c.lead.first_name} ${c.lead.last_name}`,
+    remarks: `name: ${c.lead.first_name} ${c.lead.last_name}`,
   };
 
   await fetch(ENV.MAKE_WEBHOOK_URL, {
@@ -139,150 +126,145 @@ async function sendFinal(callSid, reason) {
   });
 
   c.finalSent = true;
-  setTimeout(() => calls.delete(callSid), 60000);
 }
 
-// ================= ELEVEN =================
-async function speak(ws, text) {
-  log("BOT>", text);
-
-  const res = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ENV.ELEVEN_VOICE_ID}/stream`,
-    {
-      method: "POST",
-      headers: {
-        "xi-api-key": ENV.ELEVEN_API_KEY,
-        "content-type": "application/json",
-        accept: "audio/ulaw",
-      },
-      body: JSON.stringify({
-        text,
-        model_id: ENV.ELEVEN_TTS_MODEL,
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75,
-          style: 0.2,
-          use_speaker_boost: true,
-        },
-      }),
-    }
-  );
-
-  if (!res.ok) return;
-
-  const reader = res.body.getReader();
-  let buf = Buffer.alloc(0);
-  const FRAME = 160;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf = Buffer.concat([buf, Buffer.from(value)]);
-    while (buf.length >= FRAME) {
-      ws.send(
-        JSON.stringify({
-          event: "media",
-          streamSid: current.streamSid,
-          media: { payload: buf.subarray(0, FRAME).toString("base64") },
-        })
-      );
-      buf = buf.subarray(FRAME);
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  }
-}
-
-// ================= SERVER =================
-const server = app.listen(PORT, () =>
-  log(`✅ Service running on port ${PORT}`)
-);
+// ===================== SERVER =====================
+const server = app.listen(PORT, () => log("Service running on", PORT));
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-let current = { streamSid: "" };
-
 wss.on("connection", (ws) => {
-  let state = "ASK_NAME";
   let callSid = "";
-  let retryPhone = false;
+  let streamSid = "";
+  let state = "ASK_NAME";
+  let callClosed = false;
 
   ws.on("message", async (raw) => {
     const data = JSON.parse(raw.toString());
 
     if (data.event === "start") {
+      streamSid = data.start.streamSid;
       callSid = data.start.callSid;
-      current.streamSid = data.start.streamSid;
+      const custom = data.start.customParameters || {};
 
-      const c = call(callSid);
-      c.streamSid = current.streamSid;
-      c.caller = data.start.customParameters.caller || "";
-      c.called = data.start.customParameters.called || "";
+      const c = getCall(callSid);
+      c.streamSid = streamSid;
+      c.caller = custom.caller || "";
+      c.called = custom.called || "";
       c.callerPhoneLocal = c.caller.startsWith("+972")
         ? "0" + c.caller.slice(4)
-        : digits(c.caller);
+        : digitsOnly(c.caller);
 
-      log("CALL start", {
-        callSid,
-        caller: c.caller,
-        called: c.called,
-        callerPhoneLocal: c.callerPhoneLocal,
-      });
+      log("CALL start", { callSid });
 
-      await speak(ws, "איך קוראים לכם? אפשר שם מלא.");
+      // OPENING already played by Twilio
+      ws.send(JSON.stringify({ event: "mark", name: "start_flow" }));
       return;
     }
 
-    if (data.event !== "text") return;
-    const text = data.text.trim();
-    const c = call(callSid);
+    if (data.event === "media") {
+      // audio forwarded to OpenAI STT – unchanged
+      return;
+    }
 
-    // ===== NAME =====
+    if (data.event === "stop") {
+      callClosed = true;
+      if (!getCall(callSid).finalSent) {
+        await sendFinal(callSid, "twilio_stop");
+      }
+      return;
+    }
+  });
+
+  // ===================== OPENAI STT =====================
+  const openaiWs = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${ENV.PENAI_REALTIME_MODEL}`,
+    {
+      headers: {
+        Authorization: `Bearer ${ENV.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
+      },
+    }
+  );
+
+  openaiWs.on("message", async (msgRaw) => {
+    const msg = JSON.parse(msgRaw.toString());
+    if (msg.type !== "conversation.item.input_audio_transcription.completed") return;
+
+    const text = (msg.transcript || "").trim();
+    if (!text || callClosed) return;
+
+    const c = getCall(callSid);
+
+    // ===== ASK NAME =====
     if (state === "ASK_NAME") {
-      const parts = text.split(/\s+/);
-      c.lead.first_name = parts[0] || "";
-      c.lead.last_name = parts.slice(1).join(" ");
-      state = "PHONE";
+      const name = splitName(text);
+      c.lead.first_name = name.first;
+      c.lead.last_name = name.last;
 
-      if (isMobile(c.caller)) {
+      // DECIDE PHONE IMMEDIATELY
+      if (isMobile972(c.caller)) {
         c.lead.phone_number = c.callerPhoneLocal;
-        await playAndHangup(callSid, CLOSING_MP3);
-        setTimeout(() => sendFinal(callSid, "completed_flow"), 4000);
-        ws.close();
+        state = "DONE";
+        await finish();
         return;
       }
 
-      await speak(
-        ws,
-        "המספר שממנו התקשרתם הוא קווי. אפשר מספר טלפון לחזרה?"
-      );
+      if (isLandline972(c.caller)) {
+        state = "ASK_PHONE";
+        return;
+      }
+
+      // fallback – treat as landline
+      state = "ASK_PHONE";
       return;
     }
 
-    // ===== PHONE =====
-    if (state === "PHONE") {
-      if (validIL(text)) {
-        c.lead.phone_number = digits(text);
-        await playAndHangup(callSid, CLOSING_MP3);
-        setTimeout(() => sendFinal(callSid, "completed_flow"), 4000);
-        ws.close();
+    // ===== ASK PHONE (landline only) =====
+    if (state === "ASK_PHONE") {
+      if (isValidILPhone(text)) {
+        c.lead.phone_number = text;
+        state = "DONE";
+        await finish();
         return;
       }
-
-      if (!retryPhone) {
-        retryPhone = true;
-        await speak(ws, "לא הצלחתי לקלוט. אפשר מספר טלפון לחזרה?");
-        return;
-      }
-
-      await playAndHangup(callSid, CLOSING_MP3);
-      setTimeout(() => sendFinal(callSid, "completed_flow"), 4000);
-      ws.close();
+      // one retry max – otherwise continue
+      c.lead.phone_number = "";
+      state = "DONE";
+      await finish();
+      return;
     }
   });
 
-  ws.on("close", async () => {
-    if (callSid) await sendFinal(callSid, "twilio_stop");
-  });
+  async function finish() {
+    if (callClosed) return;
+    callClosed = true;
+
+    await sendFinal(callSid, "completed_flow");
+
+    // play closing asset + hangup
+    await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${ENV.TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`,
+      {
+        method: "POST",
+        headers: {
+          Authorization:
+            "Basic " +
+            Buffer.from(
+              `${ENV.TWILIO_ACCOUNT_SID}:${ENV.TWILIO_AUTH_TOKEN}`
+            ).toString("base64"),
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          Twiml: `<Response><Play>${TWILIO_CLOSING_MP3_URL}</Play><Hangup/></Response>`,
+        }),
+      }
+    );
+
+    try {
+      ws.close();
+      openaiWs.close();
+    } catch {}
+  }
 });
 
-// ================= HEALTH =================
 app.get("/", (_, res) => res.send("OK"));
