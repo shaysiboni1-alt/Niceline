@@ -106,9 +106,15 @@ function normalizeText(s) {
     .trim()
     .toLowerCase();
 }
+
+// ✅ FIX (phone validation): IL practical validation.
+// - Mobile: 10 digits, starts with 05
+// - Landline: 9 digits, starts with 02/03/04/07/08/09
 function isValidILPhoneDigits(d) {
   const x = digitsOnly(d);
-  return x.length === 9 || x.length === 10;
+  if (x.length === 10 && x.startsWith("05")) return true;
+  if (x.length === 9 && /^0[234789]/.test(x)) return true;
+  return false;
 }
 
 // ✅ grouped phone for speech (prevents missing digits)
@@ -147,9 +153,6 @@ function detectYesNo(s) {
   return null;
 }
 
-// ✅ SURGICAL FIX:
-// "לא" alone must NOT end the call (it is used in CONFIRM_PHONE as "not correct").
-// Only explicit refusal phrases should end.
 function isRefusal(text) {
   const t = normalizeText(text);
   return (
@@ -929,12 +932,17 @@ wss.on("connection", (twilioWs) => {
       const transcript = (msg.transcript || "").trim();
       if (!transcript) return;
 
+      // ✅ Guard: prompt leakage sometimes returns as transcript - ignore and re-ask current question
+      if (transcript.includes("תמללו בעברית תקינה")) {
+        askCurrentQuestionQueued();
+        return;
+      }
+
       addTranscriptMemory(callSid, transcript);
       if (ENV.MB_LOG_TRANSCRIPTS) logInfo("USER>", transcript);
 
       armIdleTimers();
 
-      // ✅ refusal ONLY when it is a real refusal phrase (not "לא" as confirmation answer)
       if (isRefusal(transcript)) {
         sayQueue("בסדר. תודה ויום נעים.");
         await finishCall("user_refused", { skipClosing: true });
@@ -943,7 +951,8 @@ wss.on("connection", (twilioWs) => {
 
       if (state === STATES.OPENING) return;
 
-      if (looksOffScript(transcript)) {
+      // ✅ DO NOT run off-script during phone capture/confirm (prevents loops)
+      if (state !== STATES.ASK_PHONE && state !== STATES.CONFIRM_PHONE && looksOffScript(transcript)) {
         await handleOffScript(transcript);
         return;
       }
@@ -981,6 +990,8 @@ wss.on("connection", (twilioWs) => {
 
       if (state === STATES.ASK_PHONE) {
         const p = extractPhoneFromTranscript(transcript);
+
+        // ✅ now rejects 9-digit mobile fragments like 054322372
         if (!p || !isValidILPhoneDigits(p)) {
           retries.phone += 1;
           if (retries.phone >= 3) {
@@ -1011,14 +1022,13 @@ wss.on("connection", (twilioWs) => {
         }
 
         if (yn === "no") {
-          // ✅ must loop back to ask again (no hangup)
           state = STATES.ASK_PHONE;
           logInfo("[STATE] CONFIRM_PHONE -> ASK_PHONE (retry)");
           sayQueue("אוקיי. תגידו שוב את המספר.");
           return;
         }
 
-        // If user just says another phone instead of yes/no, accept it and re-confirm
+        // If user says another number instead of yes/no:
         const p = extractPhoneFromTranscript(transcript);
         if (p && isValidILPhoneDigits(p)) {
           pendingPhone = p;
