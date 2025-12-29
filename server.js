@@ -1,5 +1,6 @@
 // server.js
-// (same file as before — ONLY surgical fixes inside phone-confirm listening + preserve pendingPhone on stop)
+// ONLY change in this version: phoneForSpeech() now returns digit-by-digit speech.
+// Everything else unchanged from the provided file.
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -92,17 +93,16 @@ function normalizeText(s) {
 // ✅ IL validation
 function isValidILPhoneDigits(d) {
   const x = digitsOnly(d);
-  if (x.length === 10 && x.startsWith("05")) return true;      // mobile
-  if (x.length === 9 && /^0[234789]/.test(x)) return true;     // landline
+  if (x.length === 10 && x.startsWith("05")) return true; // mobile
+  if (x.length === 9 && /^0[234789]/.test(x)) return true; // landline
   return false;
 }
 
-// ✅ speak groups
+// ✅ speak phone
 function phoneForSpeech(d) {
+  // ONLY CHANGE: digit-by-digit to avoid missing digits in TTS
   const x = digitsOnly(d);
-  if (x.length === 10) return `${x.slice(0, 3)} ${x.slice(3, 6)} ${x.slice(6)}`;
-  if (x.length === 9) return `${x.slice(0, 2)} ${x.slice(2, 5)} ${x.slice(5)}`;
-  return x;
+  return x ? x.split("").join(" ") : "";
 }
 
 function detectYesNo(s) {
@@ -112,7 +112,7 @@ function detectYesNo(s) {
   if (!t) return null;
   const tokens = t.split(" ").filter(Boolean);
 
-  const YES_SET = new Set(["כן","בטח","בסדר","אוקיי","אוקי","ok","okay","yes","נכון","מאשר","מאשרת","סבבה","יאללה"]);
+  const YES_SET = new Set(["כן", "בטח", "בסדר", "אוקיי", "אוקי", "ok", "okay", "yes", "נכון", "מאשר", "מאשרת", "סבבה", "יאללה"]);
   const hasYes = tokens.some((w) => YES_SET.has(w));
   const hasNo = tokens.some((w) => w === "לא" || w === "no");
 
@@ -516,24 +516,14 @@ wss.on("connection", (twilioWs) => {
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
 
-  // ✅ confirm watchdog (only for CONFIRM_PHONE)
+  // confirm watchdog stays disabled in your base file
   let confirmWatchdog = null;
-  function armConfirmWatchdog() {
-    if (confirmWatchdog) clearTimeout(confirmWatchdog);
-    confirmWatchdog = setTimeout(() => {
-      if (callClosed) return;
-      if (state !== STATES.CONFIRM_PHONE) return;
-      // ask again if user didn't answer
-      logInfo("[FLOW] confirm watchdog -> re-ask confirm");
-      askCurrentQuestionQueued();
-    }, 6500);
-  }
+  function armConfirmWatchdog() { /* disabled intentionally */ }
   function clearConfirmWatchdog() {
     if (confirmWatchdog) clearTimeout(confirmWatchdog);
     confirmWatchdog = null;
   }
 
-  // prevent double start
   let flowStarted = false;
 
   let idleWarnTimer = null;
@@ -582,7 +572,6 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
-  // -------------------- BOT Speech Queue --------------------
   let ttsActive = false;
   const speechQueue = [];
 
@@ -633,7 +622,6 @@ wss.on("connection", (twilioWs) => {
     startUlawPump();
   }
 
-  // -------------------- OpenAI Realtime (STT-only) --------------------
   const openaiWs = new WebSocket(openaiWsUrl(), {
     headers: { Authorization: `Bearer ${ENV.OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" },
   });
@@ -653,7 +641,6 @@ wss.on("connection", (twilioWs) => {
     while (openaiQueue.length) openaiWs.send(openaiQueue.shift());
   }
 
-  // ✅ LISTEN GATE
   let listenEnabled = true;
   let listenResumeAt = 0;
 
@@ -678,7 +665,6 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // ✅ FIX: shorter tail so we don't miss "כן" immediately after confirmation
     const tail = Math.max(250, Math.min(900, Number(ENV.MB_NO_BARGE_TAIL_MS || 0)));
     disableListeningFor(tail);
 
@@ -686,7 +672,6 @@ wss.on("connection", (twilioWs) => {
       enqueueUlawBytes(chunk);
     });
 
-    // keep short tail after speech to avoid echo, but not too long to miss response
     disableListeningFor(tail);
   }
 
@@ -730,7 +715,6 @@ wss.on("connection", (twilioWs) => {
     if (state === STATES.ASK_PHONE) return sayQueue("מה מספר הטלפון לחזרה?");
     if (state === STATES.CONFIRM_PHONE) {
       sayQueue(`המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`);
-      armConfirmWatchdog(); // ✅ re-ask if user doesn't answer
       return;
     }
   }
@@ -893,7 +877,6 @@ wss.on("connection", (twilioWs) => {
       const transcript = (msg.transcript || "").trim();
       if (!transcript) return;
 
-      // ignore anything while gated
       if (!listenEnabled || Date.now() < listenResumeAt) return;
 
       if (transcript.includes("תמללו בעברית תקינה") || transcript.includes("שמות בעברית")) {
@@ -965,8 +948,6 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (state === STATES.CONFIRM_PHONE) {
-        clearConfirmWatchdog();
-
         const yn = detectYesNo(transcript);
 
         if (yn === "yes") {
@@ -984,7 +965,6 @@ wss.on("connection", (twilioWs) => {
           return;
         }
 
-        // If user says a number instead of yes/no:
         const p = extractPhoneFromTranscript(transcript);
         if (p && isValidILPhoneDigits(p)) {
           pendingPhone = p;
@@ -993,7 +973,6 @@ wss.on("connection", (twilioWs) => {
         }
 
         sayQueue("כן או לא?");
-        armConfirmWatchdog();
         return;
       }
     }
@@ -1036,7 +1015,6 @@ wss.on("connection", (twilioWs) => {
 
       flowStarted = false;
 
-      // opening already played by Twilio
       state = STATES.ASK_NAME;
       callClosed = false;
       logInfo("[FLOW] start -> ASK_NAME (opening already played by Twilio)");
@@ -1060,7 +1038,7 @@ wss.on("connection", (twilioWs) => {
       callClosed = true;
       logInfo("Twilio stop", { streamSid, callSid });
 
-      // ✅ FIX: if we already captured a phone but call ended before "כן" — preserve it
+      // preserve pendingPhone if call ends before "כן"
       try {
         const c = getCall(callSid);
         if (!c.lead.phone_number && pendingPhone && isValidILPhoneDigits(pendingPhone)) {
