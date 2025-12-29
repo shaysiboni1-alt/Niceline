@@ -10,7 +10,7 @@
 // - Webhook/CRM payload and recording behavior remain unchanged.
 //
 // Flow (strict):
-//   OPENING (MB_OPENING_TEXT) -> ASK_NAME -> CONFIRM_NAME -> CONFIRM_CALLER_LAST4 (or ASK_PHONE) -> CONFIRM_PHONE -> CLOSING -> hangup
+//   OPENING (MB_OPENING_TEXT) -> ASK_NAME -> (AUTO PHONE LOGIC) -> ASK_PHONE -> CONFIRM_PHONE -> CLOSING -> hangup
 //
 // Notes:
 // - We DO NOT ask for consent at all.
@@ -82,7 +82,6 @@ const ENV = {
 const TWILIO_OPENING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/opening.mp3";
 const TWILIO_CLOSING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/closing.mp3";
 
-
 function logInfo(...args) {
   console.log("[INFO]", ...args);
 }
@@ -143,7 +142,7 @@ function detectYesNo(s) {
 
 function isRefusal(text) {
   const t = normalizeText(text);
-  return t.includes("לא רוצה") || t.includes("עזוב") || t === "ביי" || t.includes("לא מעוניין") || t.includes("לא מעוניינת") || t === "לא";
+  return t.includes("לא רוצה") || t === "ביי" || t.includes("לא מעוניין") || t.includes("לא מעוניינת") || t === "לא" || t === "עזוב" || t === "עזבי";
 }
 
 // -------------------- OpenAI prompt extraction --------------------
@@ -463,7 +462,7 @@ async function elevenStreamUlaw(text, onAudioChunk) {
 async function openaiFallbackReply({ userText, state, question }) {
   // If no key, just return a deterministic nudge.
   if (!ENV.OPENAI_API_KEY) {
-    return question || "אפשר לחזור רגע—מה השם שלכם? שם פרטי ושם משפחה.";
+    return question || "אפשר לחזור רגע—מה השם המלא שלכם?";
   }
 
   const sys =
@@ -532,8 +531,6 @@ wss.on("connection", (twilioWs) => {
   const STATES = {
     OPENING: "OPENING",
     ASK_NAME: "ASK_NAME",
-    CONFIRM_NAME: "CONFIRM_NAME",
-    CONFIRM_CALLER_LAST4: "CONFIRM_CALLER_LAST4",
     ASK_PHONE: "ASK_PHONE",
     CONFIRM_PHONE: "CONFIRM_PHONE",
     DONE: "DONE",
@@ -541,7 +538,7 @@ wss.on("connection", (twilioWs) => {
 
   let state = STATES.OPENING;
   let callClosed = false;
-  let retries = { name: 0, phone: 0, confirmPhone: 0, offscript: 0, last4Choice: 0 };
+  let retries = { name: 0, phone: 0, confirmPhone: 0, offscript: 0 };
 
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
@@ -649,7 +646,7 @@ wss.on("connection", (twilioWs) => {
   }
 
   async function speakWithEleven(text) {
-if (!assertElevenConfigured()) {
+    if (!assertElevenConfigured()) {
       // Fail-safe: do nothing, but log
       logError("Eleven not configured (missing ELEVEN_API_KEY/ELEVEN_VOICE_ID)");
       return;
@@ -700,23 +697,8 @@ if (!assertElevenConfigured()) {
   function askCurrentQuestionQueued() {
     if (callClosed) return;
     if (state === STATES.ASK_NAME) {
-      sayQueue("מה השם שלכם? שם פרטי ושם משפחה.");
-      return;
-    }
-    if (state === STATES.CONFIRM_NAME) {
-      const full = [pendingName.first, pendingName.last].filter(Boolean).join(" ");
-      sayQueue(`רשמתי ${full}. נכון?`);
-      return;
-    }
-    if (state === STATES.CONFIRM_CALLER_LAST4) {
-      const last4 = last4Digits(callerPhoneLocal);
-      if (last4) {
-        sayQueue(`אני מזהה שארבע הַסְּפרוֹת האחרונות של מִסְפָּר הטלפון שלכם מסתיימות ב-${digitsSpaced(last4)}.`);
-        sayQueue("תרצו שנחזור למספר הזה, או למספר אחר?");
-      } else {
-        state = STATES.ASK_PHONE;
-        askCurrentQuestionQueued();
-      }
+      // שינוי לפי בקשת המשתמש: שם מלא (בלי "פרטי ומשפחה")
+      sayQueue("מה השם המלא שלכם?");
       return;
     }
     if (state === STATES.ASK_PHONE) {
@@ -760,6 +742,7 @@ if (!assertElevenConfigured()) {
     if (parts.length === 0) return null;
     if (parts.length > 6) return null;
 
+    // שינוי לפי בקשת המשתמש: אם שם אחד -> FIRSTNAME בלבד, אם יותר -> FIRSTNAME + LASTNAME (כל השאר)
     if (parts.length === 1) return { first: parts[0], last: "" };
     return { first: parts[0], last: parts.slice(1).join(" ") };
   }
@@ -792,6 +775,23 @@ if (!assertElevenConfigured()) {
     return "";
   }
 
+  // -------------------- Caller type logic (per user request) --------------------
+  function isMobileCallerE164(e164) {
+    const s = safeStr(e164);
+    return s.startsWith("+9725");
+  }
+  function isLandlineCallerE164(e164) {
+    const s = safeStr(e164);
+    return (
+      s.startsWith("+9722") ||
+      s.startsWith("+9723") ||
+      s.startsWith("+9724") ||
+      s.startsWith("+9727") ||
+      s.startsWith("+9728") ||
+      s.startsWith("+9729")
+    );
+  }
+
   // -------------------- Fallback trigger --------------------
   function looksOffScript(userText) {
     const t = normalizeText(userText);
@@ -813,12 +813,7 @@ if (!assertElevenConfigured()) {
   async function handleOffScript(userText) {
     retries.offscript += 1;
     const questionTextForState = (() => {
-      if (state === STATES.ASK_NAME) return "מה השם שלכם? שם פרטי ושם משפחה.";
-      if (state === STATES.CONFIRM_NAME) return `רשמתי ${[pendingName.first,pendingName.last].filter(Boolean).join(" ")}. נכון?`;
-      if (state === STATES.CONFIRM_CALLER_LAST4) {
-        const last4 = last4Digits(callerPhoneLocal);
-        return last4 ? `אני מזהה שה־4 הספרות האחרונות של המספר שלכם מסתיימות ב-${digitsSpaced(last4)}. תרצו שנחזור למספר הזה, או למספר אחר?` : "מה מספר הטלפון לחזרה? ספרה-ספרה.";
-      }
+      if (state === STATES.ASK_NAME) return "מה השם המלא שלכם?";
       if (state === STATES.ASK_PHONE) return "מה מספר הטלפון לחזרה? ספרה-ספרה.";
       if (state === STATES.CONFIRM_PHONE) return `המספר הוא ${digitsSpaced(pendingPhone)}. נכון?`;
       return "אפשר לענות רגע?";
@@ -1003,98 +998,39 @@ if (!assertElevenConfigured()) {
             await finishCall("name_missing", { skipClosing: true });
             return;
           }
-          sayQueue("לא שמעתי טוב. שם פרטי ושם משפחה.");
+          // שינוי תסריט: בקשה חוזרת לשם מלא (בלי אימות)
+          sayQueue("לא שמעתי טוב. מה השם המלא שלכם?");
           return;
         }
 
+        // שינוי לפי בקשת המשתמש: אין אימות שם — שומרים מיד
         pendingName = nameObj;
-        state = STATES.CONFIRM_NAME;
-        logInfo("[STATE] ASK_NAME -> CONFIRM_NAME", pendingName);
-        askCurrentQuestionQueued();
-        return;
-      }
+        const c = getCall(callSid);
+        c.lead.first_name = pendingName.first || "";
+        c.lead.last_name = pendingName.last || "";
 
-      if (state === STATES.CONFIRM_NAME) {
-        const yn = detectYesNo(transcript);
-        if (yn === "yes") {
-          const c = getCall(callSid);
-          c.lead.first_name = pendingName.first || "";
-          c.lead.last_name = pendingName.last || "";
-          retries.last4Choice = 0;
-          state = callerPhoneLocal ? STATES.CONFIRM_CALLER_LAST4 : STATES.ASK_PHONE;
-          logInfo("[STATE] CONFIRM_NAME ->", state);
+        // שינוי לפי בקשת המשתמש: לוגיקת טלפון לפי קידומת Caller ID
+        if (caller && isMobileCallerE164(caller) && callerPhoneLocal) {
+          c.lead.phone_number = callerPhoneLocal;
+          logInfo("[STATE] ASK_NAME -> DONE (mobile caller, use caller)", { phone_number: callerPhoneLocal, name: pendingName });
+          await finishCall("completed_flow");
+          return;
+        }
+
+        if (caller && isLandlineCallerE164(caller)) {
+          // נייח: מבקשים טלפון לחזרה
+          state = STATES.ASK_PHONE;
+          logInfo("[STATE] ASK_NAME -> ASK_PHONE (landline caller)", { caller });
           askCurrentQuestionQueued();
           return;
         }
-        if (yn === "no") {
-          state = STATES.ASK_NAME;
-          logInfo("[STATE] CONFIRM_NAME -> ASK_NAME (retry)");
-          sayQueue("אוקיי. תגידו שוב שם פרטי ושם משפחה.");
-          return;
-        }
-        sayQueue("כן או לא?");
+
+        // ברירת מחדל (ללא שינוי דרמטי מעבר לבקשה): אם אין/לא ברור Caller — מבקשים טלפון לחזרה
+        state = STATES.ASK_PHONE;
+        logInfo("[STATE] ASK_NAME -> ASK_PHONE (default)", { caller });
+        askCurrentQuestionQueued();
         return;
       }
-
-      if (state === STATES.CONFIRM_CALLER_LAST4) {
-  const tRaw = transcript || "";
-  const t = normalizeText(tRaw);
-  const yn = detectYesNo(tRaw);
-
-  const saysOther =
-    yn === "no" ||
-    t.includes("מספר אחר") ||
-    t.includes("מספר חדש") ||
-    t.includes("חדש") ||
-    (t.includes("אחר") && !t.includes("האחרון"));
-
-  const saysThis =
-    yn === "yes" ||
-    t.includes("למספר הזה") ||
-    t.includes("המספר הזה") ||
-    t.includes("לזה") ||
-    t === "זה" ||
-    t === "הזה" ||
-    (t.includes("זה") && !saysOther);
-
-  // If caller directly says a phone number, treat it as "other number provided"
-  const directPhone = extractPhoneFromTranscript(tRaw);
-
-  if (saysThis) {
-    const c = getCall(callSid);
-    c.lead.phone_number = callerPhoneLocal;
-    logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (use caller)", { phone_number: callerPhoneLocal });
-    await finishCall("completed_flow");
-    return;
-  }
-
-  if (directPhone && isValidILPhoneDigits(directPhone)) {
-    pendingPhone = directPhone;
-    state = STATES.CONFIRM_PHONE;
-    logInfo("[STATE] CONFIRM_CALLER_LAST4 -> CONFIRM_PHONE (provided new phone)", { phone_number: pendingPhone });
-    askCurrentQuestionQueued();
-    return;
-  }
-
-  if (saysOther) {
-    state = STATES.ASK_PHONE;
-    logInfo("[STATE] CONFIRM_CALLER_LAST4 -> ASK_PHONE");
-    askCurrentQuestionQueued();
-    return;
-  }
-
-  retries.last4Choice += 1;
-  if (retries.last4Choice >= 3) {
-    const c = getCall(callSid);
-    c.lead.phone_number = callerPhoneLocal;
-    logInfo("[STATE] CONFIRM_CALLER_LAST4 -> DONE (default use caller after retries)", { phone_number: callerPhoneLocal });
-    await finishCall("completed_flow");
-    return;
-  }
-
-  sayQueue("רק לבחור: המספר הזה, או מספר אחר?");
-  return;
-}
 
       if (state === STATES.ASK_PHONE) {
         const p = extractPhoneFromTranscript(transcript);
@@ -1191,11 +1127,11 @@ if (!assertElevenConfigured()) {
       if (rec.ok) c.recordingSid = rec.sid || "";
 
       // OPENING:
-// If Twilio already played opening.mp3 (opening_played=1), do NOT speak MB_OPENING_TEXT again.
+      // If Twilio already played opening.mp3 (opening_played=1), do NOT speak MB_OPENING_TEXT again.
       if (openingPlayedByTwilio) {
         state = STATES.ASK_NAME;
         callClosed = false;
-      logInfo("[FLOW] start -> ASK_NAME (opening already played by Twilio)");
+        logInfo("[FLOW] start -> ASK_NAME (opening already played by Twilio)");
         // Start immediately (stream starts only after Twilio <Play> finished)
         setTimeout(() => startFlowProactively(), 0);
       } else {
