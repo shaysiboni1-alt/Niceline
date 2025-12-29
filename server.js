@@ -3,18 +3,8 @@
 // NiceLine / מרכז מל"מ – Voice AI (Render-first, Scripted Flow)
 // Twilio Media Streams <-> Render (this server)
 //
-// GOAL (per user):
-// - Full scripted conversation is controlled ONLY from Render (including opening).
-// - ElevenLabs is used for ALL bot speech (fast, deterministic).
-// - OpenAI Realtime is used ONLY for STT (transcription) and as a SHORT fallback when caller goes off-script.
-// - Webhook/CRM payload and recording behavior remain unchanged.
-//
 // Flow (strict):
 //   OPENING (MB_OPENING_TEXT) -> ASK_NAME -> (AUTO PHONE LOGIC) -> ASK_PHONE -> CONFIRM_PHONE -> CLOSING -> hangup
-//
-// Notes:
-// - We DO NOT ask for consent at all.
-// - We keep the existing ENV names and CRM payload structure.
 
 const express = require("express");
 const WebSocket = require("ws");
@@ -59,7 +49,6 @@ const ENV = {
 
   OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
   OPENAI_VOICE: process.env.OPENAI_VOICE || "cedar",
-  // In your project this is spelled PENAI_REALTIME_MODEL (do not rename)
   PENAI_REALTIME_MODEL: process.env.PENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28",
 
   PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || "",
@@ -79,7 +68,6 @@ const ENV = {
   ELEVENLABS_STYLE: Number(process.env.ELEVENLABS_STYLE || "0.15"),
 };
 
-// Twilio Assets (recorded audio)
 const TWILIO_OPENING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/opening.mp3";
 const TWILIO_CLOSING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/closing.mp3";
 
@@ -107,25 +95,22 @@ function normalizeText(s) {
     .toLowerCase();
 }
 
-// ✅ FIX (phone validation): IL practical validation.
-// - Mobile: 10 digits, starts with 05
-// - Landline: 9 digits, starts with 02/03/04/07/08/09
+// ✅ IL validation
 function isValidILPhoneDigits(d) {
   const x = digitsOnly(d);
-  if (x.length === 10 && x.startsWith("05")) return true;
-  if (x.length === 9 && /^0[234789]/.test(x)) return true;
+  if (x.length === 10 && x.startsWith("05")) return true;      // mobile
+  if (x.length === 9 && /^0[234789]/.test(x)) return true;     // landline
   return false;
 }
 
-// ✅ grouped phone for speech (prevents missing digits)
+// ✅ speak groups (prevents missing digits)
 function phoneForSpeech(d) {
   const x = digitsOnly(d);
-  if (x.length === 10) return `${x.slice(0, 3)} ${x.slice(3, 6)} ${x.slice(6)}`; // 050 322 2237
-  if (x.length === 9) return `${x.slice(0, 2)} ${x.slice(2, 5)} ${x.slice(5)}`; // 03 123 4567
+  if (x.length === 10) return `${x.slice(0, 3)} ${x.slice(3, 6)} ${x.slice(6)}`;
+  if (x.length === 9) return `${x.slice(0, 2)} ${x.slice(2, 5)} ${x.slice(5)}`;
   return x;
 }
 
-// Yes/No detection (flexible)
 function detectYesNo(s) {
   const raw = safeStr(s);
   if (!raw) return null;
@@ -166,7 +151,6 @@ function isRefusal(text) {
   );
 }
 
-// -------------------- OpenAI prompt extraction --------------------
 function getSystemPromptFromMBConversationPrompt() {
   const raw = ENV.MB_CONVERSATION_PROMPT || "";
   if (!raw.trim()) return "";
@@ -182,7 +166,6 @@ function openaiWsUrl() {
   return `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
 }
 
-// -------------------- HTTP helpers --------------------
 async function postJson(url, payload) {
   if (!url) return { ok: false, reason: "webhook_not_configured" };
   try {
@@ -198,7 +181,6 @@ async function postJson(url, payload) {
   }
 }
 
-// -------------------- Twilio REST helpers --------------------
 function twilioAuthHeader() {
   if (!ENV.TWILIO_ACCOUNT_SID || !ENV.TWILIO_AUTH_TOKEN) return "";
   const b64 = Buffer.from(`${ENV.TWILIO_ACCOUNT_SID}:${ENV.TWILIO_AUTH_TOKEN}`).toString("base64");
@@ -290,7 +272,6 @@ app.post("/twilio-recording-callback", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// -------------------- Public recording proxy --------------------
 app.get("/recording/:sid.mp3", async (req, res) => {
   try {
     const sid = (req.params?.sid || "").trim();
@@ -361,7 +342,6 @@ function getPublicOrigin() {
   }
 }
 
-// -------------------- Final send --------------------
 async function waitForRecording(callSid, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -422,7 +402,6 @@ async function sendFinal(callSid, reason) {
 function assertElevenConfigured() {
   return !!ENV.ELEVEN_API_KEY && !!ENV.ELEVEN_VOICE_ID;
 }
-
 function toBase64(buf) {
   return Buffer.from(buf).toString("base64");
 }
@@ -476,9 +455,7 @@ async function elevenStreamUlaw(text, onAudioChunk) {
 
 // -------------------- OpenAI fallback --------------------
 async function openaiFallbackReply({ userText, state, question }) {
-  if (!ENV.OPENAI_API_KEY) {
-    return question || "אפשר לחזור רגע—מה השם המלא שלכם?";
-  }
+  if (!ENV.OPENAI_API_KEY) return question || "אפשר לחזור רגע—מה השם המלא שלכם?";
 
   const sys =
     "אתם עוזרים טלפוניים קצרים בעברית. " +
@@ -514,10 +491,8 @@ async function openaiFallbackReply({ userText, state, question }) {
     if (!res.ok) throw new Error(json?.error?.message || "fallback_http_error");
 
     const out = (json.output_text || "").toString().trim();
-    if (out) return out.slice(0, 240);
-
-    return question || "אפשר לענות רגע על השאלה?";
-  } catch (e) {
+    return out ? out.slice(0, 240) : (question || "אפשר לענות רגע על השאלה?");
+  } catch {
     return question || "אפשר לענות רגע על השאלה?";
   }
 }
@@ -558,6 +533,9 @@ wss.on("connection", (twilioWs) => {
   let idleHangTimer = null;
   let maxCallTimer = null;
   let maxCallWarnTimer = null;
+
+  // ✅ GUARD: prevent double-start (fixes "BOT> מה השם..." twice)
+  let flowStarted = false;
 
   function clearTimers() {
     if (idleWarnTimer) clearTimeout(idleWarnTimer);
@@ -651,14 +629,64 @@ wss.on("connection", (twilioWs) => {
     startUlawPump();
   }
 
+  // -------------------- OpenAI Realtime (STT-only) --------------------
+  const openaiWs = new WebSocket(openaiWsUrl(), {
+    headers: {
+      Authorization: `Bearer ${ENV.OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    },
+  });
+
+  let openaiReady = false;
+  const openaiQueue = [];
+
+  function sendOpenAI(obj) {
+    const msg = JSON.stringify(obj);
+    if (!openaiReady) {
+      openaiQueue.push(msg);
+      return;
+    }
+    openaiWs.send(msg);
+  }
+
+  function flushOpenAI() {
+    while (openaiQueue.length) openaiWs.send(openaiQueue.shift());
+  }
+
+  // ✅ LISTEN GATE: do not listen while bot is speaking (+ tail)
+  let listenEnabled = true;
+  let listenResumeAt = 0;
+
+  function disableListeningFor(ms) {
+    const until = Date.now() + Math.max(0, ms || 0);
+    listenEnabled = false;
+    listenResumeAt = Math.max(listenResumeAt, until);
+
+    // Clear any buffered audio so STT won't "complete" on bot echo residue
+    try { sendOpenAI({ type: "input_audio_buffer.clear" }); } catch {}
+
+    setTimeout(() => {
+      if (Date.now() >= listenResumeAt) {
+        listenEnabled = true;
+        try { sendOpenAI({ type: "input_audio_buffer.clear" }); } catch {}
+      }
+    }, Math.max(0, until - Date.now()));
+  }
+
   async function speakWithEleven(text) {
     if (!assertElevenConfigured()) {
       logError("Eleven not configured (missing ELEVEN_API_KEY/ELEVEN_VOICE_ID)");
       return;
     }
+
+    // ✅ turn off listening during TTS + tail
+    disableListeningFor((ENV.MB_NO_BARGE_TAIL_MS || 0) + 2500);
+
     await elevenStreamUlaw(text, async (chunk) => {
       enqueueUlawBytes(chunk);
     });
+
+    // after TTS stream ends, keep tail (already included above)
   }
 
   async function tryDequeueSpeech() {
@@ -695,24 +723,18 @@ wss.on("connection", (twilioWs) => {
     tryDequeueSpeech().catch(() => {});
   }
 
-  // -------------------- FLOW Questions --------------------
   function askCurrentQuestionQueued() {
     if (callClosed) return;
-    if (state === STATES.ASK_NAME) {
-      sayQueue("מה השם המלא שלכם?");
-      return;
-    }
-    if (state === STATES.ASK_PHONE) {
-      sayQueue("מה מספר הטלפון לחזרה?");
-      return;
-    }
-    if (state === STATES.CONFIRM_PHONE) {
-      sayQueue(`המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`);
-      return;
-    }
+    if (state === STATES.ASK_NAME) return sayQueue("מה השם המלא שלכם?");
+    if (state === STATES.ASK_PHONE) return sayQueue("מה מספר הטלפון לחזרה?");
+    if (state === STATES.CONFIRM_PHONE) return sayQueue(`המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`);
   }
 
   function startFlowProactively() {
+    // ✅ prevent double start
+    if (flowStarted) return;
+    flowStarted = true;
+
     logInfo("[FLOW] opening -> ASK_NAME (proactive)");
     state = STATES.ASK_NAME;
     askCurrentQuestionQueued();
@@ -720,7 +742,6 @@ wss.on("connection", (twilioWs) => {
     armMaxCallTimers();
   }
 
-  // -------------------- Name + phone parsing --------------------
   function cleanHebrewName(raw) {
     return (raw || "")
       .toString()
@@ -774,13 +795,11 @@ wss.on("connection", (twilioWs) => {
     return "";
   }
 
-  // -------------------- Caller type logic --------------------
   function isMobileCallerE164(e164) {
     const s = safeStr(e164);
     return s.startsWith("+9725");
   }
 
-  // -------------------- Fallback trigger --------------------
   function looksOffScript(userText) {
     const t = normalizeText(userText);
     if (!t) return false;
@@ -811,7 +830,6 @@ wss.on("connection", (twilioWs) => {
     setTimeout(() => askCurrentQuestionQueued(), 250);
   }
 
-  // -------------------- End / Closing --------------------
   async function finishCall(reason, opts = {}) {
     if (!callSid) return;
     callClosed = true;
@@ -867,30 +885,6 @@ wss.on("connection", (twilioWs) => {
     }, endAfterMs);
   }
 
-  // -------------------- OpenAI Realtime (STT-only) --------------------
-  const openaiWs = new WebSocket(openaiWsUrl(), {
-    headers: {
-      Authorization: `Bearer ${ENV.OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
-  });
-
-  let openaiReady = false;
-  const openaiQueue = [];
-
-  function sendOpenAI(obj) {
-    const msg = JSON.stringify(obj);
-    if (!openaiReady) {
-      openaiQueue.push(msg);
-      return;
-    }
-    openaiWs.send(msg);
-  }
-
-  function flushOpenAI() {
-    while (openaiQueue.length) openaiWs.send(openaiQueue.shift());
-  }
-
   openaiWs.on("open", () => {
     openaiReady = true;
     logInfo("OpenAI WS open");
@@ -922,18 +916,19 @@ wss.on("connection", (twilioWs) => {
 
   openaiWs.on("message", async (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (msg.transcript || "").trim();
       if (!transcript) return;
 
-      // ✅ Guard: prompt leakage sometimes returns as transcript - ignore and re-ask current question
-      if (transcript.includes("תמללו בעברית תקינה")) {
+      // ✅ do not accept any transcript while bot is speaking / tail window
+      if (!listenEnabled || Date.now() < listenResumeAt) {
+        return;
+      }
+
+      // ✅ prompt leakage ignore
+      if (transcript.includes("תמללו בעברית תקינה") || transcript.includes("שמות בעברית")) {
         askCurrentQuestionQueued();
         return;
       }
@@ -951,7 +946,7 @@ wss.on("connection", (twilioWs) => {
 
       if (state === STATES.OPENING) return;
 
-      // ✅ DO NOT run off-script during phone capture/confirm (prevents loops)
+      // ✅ no offscript during phone capture/confirm
       if (state !== STATES.ASK_PHONE && state !== STATES.CONFIRM_PHONE && looksOffScript(transcript)) {
         await handleOffScript(transcript);
         return;
@@ -983,7 +978,7 @@ wss.on("connection", (twilioWs) => {
         }
 
         state = STATES.ASK_PHONE;
-        logInfo("[STATE] ASK_NAME -> ASK_PHONE", { caller });
+        logInfo("[STATE] ASK_NAME -> ASK_PHONE", { caller: caller || "anonymous" });
         askCurrentQuestionQueued();
         return;
       }
@@ -991,7 +986,6 @@ wss.on("connection", (twilioWs) => {
       if (state === STATES.ASK_PHONE) {
         const p = extractPhoneFromTranscript(transcript);
 
-        // ✅ now rejects 9-digit mobile fragments like 054322372
         if (!p || !isValidILPhoneDigits(p)) {
           retries.phone += 1;
           if (retries.phone >= 3) {
@@ -1028,7 +1022,6 @@ wss.on("connection", (twilioWs) => {
           return;
         }
 
-        // If user says another number instead of yes/no:
         const p = extractPhoneFromTranscript(transcript);
         if (p && isValidILPhoneDigits(p)) {
           pendingPhone = p;
@@ -1050,14 +1043,9 @@ wss.on("connection", (twilioWs) => {
   openaiWs.on("close", () => logInfo("OpenAI WS closed"));
   openaiWs.on("error", (e) => logError("OpenAI WS error", String(e?.message || e)));
 
-  // -------------------- Twilio stream events --------------------
   twilioWs.on("message", async (raw) => {
     let data;
-    try {
-      data = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(raw.toString()); } catch { return; }
 
     if (data.event === "start") {
       streamSid = data.start?.streamSid || "";
@@ -1083,6 +1071,9 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
+      // ✅ reset flow guard per call
+      flowStarted = false;
+
       if (openingPlayedByTwilio) {
         state = STATES.ASK_NAME;
         callClosed = false;
@@ -1106,6 +1097,10 @@ wss.on("connection", (twilioWs) => {
     if (data.event === "media") {
       const payload = data.media?.payload;
       if (!payload) return;
+
+      // ✅ DO NOT feed OpenAI while bot is speaking / tail
+      if (!listenEnabled || Date.now() < listenResumeAt) return;
+
       sendOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
@@ -1141,5 +1136,4 @@ wss.on("connection", (twilioWs) => {
   twilioWs.on("error", (e) => logError("Twilio WS error", String(e?.message || e)));
 });
 
-// -------------------- Health --------------------
 app.get("/", (req, res) => res.status(200).send("OK"));
