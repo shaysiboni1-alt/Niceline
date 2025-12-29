@@ -25,7 +25,7 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 10000;
 
-// -------------------- ENV (keep existing names; add Eleven-only without touching existing) --------------------
+// ===================== ENV =====================
 const ENV = {
   MAKE_WEBHOOK_URL: process.env.MAKE_WEBHOOK_URL || "",
 
@@ -68,7 +68,7 @@ const ENV = {
   TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN || "",
   TIME_ZONE: process.env.TIME_ZONE || "Asia/Jerusalem",
 
-  // ElevenLabs (already added in Render)
+  // ElevenLabs
   ELEVEN_API_KEY: process.env.ELEVEN_API_KEY || "",
   ELEVEN_ENABLE_STREAM_ENDPOINT: String(process.env.ELEVEN_ENABLE_STREAM_ENDPOINT || "true").toLowerCase() === "true",
   ELEVEN_OUTPUT_FORMAT: process.env.ELEVEN_OUTPUT_FORMAT || "ulaw_8000",
@@ -78,7 +78,8 @@ const ENV = {
   ELEVENLABS_STABILITY: Number(process.env.ELEVENLABS_STABILITY || "0.5"),
   ELEVENLABS_STYLE: Number(process.env.ELEVENLABS_STYLE || "0.15"),
 };
-// Twilio Assets (recorded audio) for instant start/end (no TTS latency)
+
+// Twilio Assets (recorded audio)
 const TWILIO_OPENING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/opening.mp3";
 const TWILIO_CLOSING_MP3_URL = "https://toolbox-hummingbird-8667.twil.io/assets/closing.mp3";
 
@@ -109,21 +110,13 @@ function isValidILPhoneDigits(d) {
   const x = digitsOnly(d);
   return x.length === 9 || x.length === 10;
 }
-function digitsSpaced(d) {
-  const x = digitsOnly(d);
-  return x.split("").join(" ");
-}
+
+// ✅ grouped phone for speech (prevents missing digits)
 function phoneForSpeech(d) {
-  // ✅ change ONLY for readback quality: speak in groups (prevents missing digits in TTS)
   const x = digitsOnly(d);
   if (x.length === 10) return `${x.slice(0, 3)} ${x.slice(3, 6)} ${x.slice(6)}`; // 050 322 2237
-  if (x.length === 9) return `${x.slice(0, 2)} ${x.slice(2, 5)} ${x.slice(5)}`;  // 03 123 4567
+  if (x.length === 9) return `${x.slice(0, 2)} ${x.slice(2, 5)} ${x.slice(5)}`; // 03 123 4567
   return x;
-}
-function last4Digits(d) {
-  const x = digitsOnly(d);
-  if (x.length < 4) return "";
-  return x.slice(-4);
 }
 
 // Yes/No detection (flexible)
@@ -138,7 +131,14 @@ function detectYesNo(s) {
   const hasYes = tokens.some((w) => YES_SET.has(w));
   const hasNo = tokens.some((w) => w === "לא" || w === "no");
 
-  const hasStrongNo = t.includes("לא רוצה") || t.includes("לא מעוניין") || t.includes("לא מעוניינת") || t.includes("ממש לא") || t === "עזוב" || t === "עזבי";
+  const hasStrongNo =
+    t.includes("לא רוצה") ||
+    t.includes("לא מעוניין") ||
+    t.includes("לא מעוניינת") ||
+    t.includes("ממש לא") ||
+    t === "עזוב" ||
+    t === "עזבי";
+
   const short = tokens.length <= 6;
 
   if (hasStrongNo) return "no";
@@ -147,9 +147,20 @@ function detectYesNo(s) {
   return null;
 }
 
+// ✅ SURGICAL FIX:
+// "לא" alone must NOT end the call (it is used in CONFIRM_PHONE as "not correct").
+// Only explicit refusal phrases should end.
 function isRefusal(text) {
   const t = normalizeText(text);
-  return t.includes("לא רוצה") || t === "ביי" || t.includes("לא מעוניין") || t.includes("לא מעוניינת") || t === "לא" || t === "עזוב" || t === "עזבי";
+  return (
+    t.includes("לא רוצה") ||
+    t.includes("לא מעוניין") ||
+    t.includes("לא מעוניינת") ||
+    t === "ביי" ||
+    t === "להתראות" ||
+    t === "עזוב" ||
+    t === "עזבי"
+  );
 }
 
 // -------------------- OpenAI prompt extraction --------------------
@@ -502,8 +513,7 @@ async function openaiFallbackReply({ userText, state, question }) {
     const out = (json.output_text || "").toString().trim();
     if (out) return out.slice(0, 240);
 
-    const alt = JSON.stringify(json);
-    return alt ? question : question;
+    return question || "אפשר לענות רגע על השאלה?";
   } catch (e) {
     return question || "אפשר לענות רגע על השאלה?";
   }
@@ -694,7 +704,6 @@ wss.on("connection", (twilioWs) => {
       return;
     }
     if (state === STATES.CONFIRM_PHONE) {
-      // ✅ change ONLY: read phone in grouped format (not digit-by-digit)
       sayQueue(`המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`);
       return;
     }
@@ -767,17 +776,6 @@ wss.on("connection", (twilioWs) => {
     const s = safeStr(e164);
     return s.startsWith("+9725");
   }
-  function isLandlineCallerE164(e164) {
-    const s = safeStr(e164);
-    return (
-      s.startsWith("+9722") ||
-      s.startsWith("+9723") ||
-      s.startsWith("+9724") ||
-      s.startsWith("+9727") ||
-      s.startsWith("+9728") ||
-      s.startsWith("+9729")
-    );
-  }
 
   // -------------------- Fallback trigger --------------------
   function looksOffScript(userText) {
@@ -801,7 +799,7 @@ wss.on("connection", (twilioWs) => {
     const questionTextForState = (() => {
       if (state === STATES.ASK_NAME) return "מה השם המלא שלכם?";
       if (state === STATES.ASK_PHONE) return "מה מספר הטלפון לחזרה?";
-      if (state === STATES.CONFIRM_PHONE) return `המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`; // ✅ grouped
+      if (state === STATES.CONFIRM_PHONE) return `המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`;
       return "אפשר לענות רגע?";
     })();
 
@@ -836,9 +834,7 @@ wss.on("connection", (twilioWs) => {
       }
 
       setTimeout(async () => {
-        try {
-          await sendFinal(callSid, reason || "completed_flow");
-        } catch {}
+        try { await sendFinal(callSid, reason || "completed_flow"); } catch {}
         try { twilioWs.close(); } catch {}
       }, 4500);
 
@@ -938,15 +934,14 @@ wss.on("connection", (twilioWs) => {
 
       armIdleTimers();
 
+      // ✅ refusal ONLY when it is a real refusal phrase (not "לא" as confirmation answer)
       if (isRefusal(transcript)) {
         sayQueue("בסדר. תודה ויום נעים.");
         await finishCall("user_refused", { skipClosing: true });
         return;
       }
 
-      if (state === STATES.OPENING) {
-        return;
-      }
+      if (state === STATES.OPENING) return;
 
       if (looksOffScript(transcript)) {
         await handleOffScript(transcript);
@@ -954,12 +949,6 @@ wss.on("connection", (twilioWs) => {
       }
 
       if (state === STATES.ASK_NAME) {
-        const yn = detectYesNo(transcript);
-        if (yn === "yes") {
-          askCurrentQuestionQueued();
-          return;
-        }
-
         const nameObj = parseName(transcript);
         if (!nameObj) {
           retries.name += 1;
@@ -1012,6 +1001,7 @@ wss.on("connection", (twilioWs) => {
 
       if (state === STATES.CONFIRM_PHONE) {
         const yn = detectYesNo(transcript);
+
         if (yn === "yes") {
           const c = getCall(callSid);
           c.lead.phone_number = pendingPhone;
@@ -1019,13 +1009,16 @@ wss.on("connection", (twilioWs) => {
           await finishCall("completed_flow");
           return;
         }
+
         if (yn === "no") {
+          // ✅ must loop back to ask again (no hangup)
           state = STATES.ASK_PHONE;
           logInfo("[STATE] CONFIRM_PHONE -> ASK_PHONE (retry)");
           sayQueue("אוקיי. תגידו שוב את המספר.");
           return;
         }
 
+        // If user just says another phone instead of yes/no, accept it and re-confirm
         const p = extractPhoneFromTranscript(transcript);
         if (p && isValidILPhoneDigits(p)) {
           pendingPhone = p;
