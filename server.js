@@ -256,7 +256,6 @@ async function playTwilioAsset(callSid, assetUrl) {
 }
 
 // -------------------- Recording callback --------------------
-// IMPORTANT: Keep path as you already use in PUBLIC_BASE_URL (your current setup).
 app.post("/twilio-recording-callback", async (req, res) => {
   const callSid = req.body?.CallSid || "";
   const recordingUrl = req.body?.RecordingUrl || "";
@@ -296,7 +295,7 @@ app.get("/recording/:sid.mp3", async (req, res) => {
   }
 });
 
-// -------------------- Call store (keep shape compatible with your webhook) --------------------
+// -------------------- Call store --------------------
 const calls = new Map();
 
 function getCall(callSid) {
@@ -344,7 +343,7 @@ function getPublicOrigin() {
   }
 }
 
-// -------------------- Final send (DO NOT CHANGE FIELDS) --------------------
+// -------------------- Final send --------------------
 async function waitForRecording(callSid, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -401,7 +400,7 @@ async function sendFinal(callSid, reason) {
   setTimeout(() => calls.delete(callSid), 60_000);
 }
 
-// -------------------- ElevenLabs TTS (ulaw_8000 streaming) --------------------
+// -------------------- ElevenLabs TTS --------------------
 function assertElevenConfigured() {
   return !!ENV.ELEVEN_API_KEY && !!ENV.ELEVEN_VOICE_ID;
 }
@@ -411,7 +410,6 @@ function toBase64(buf) {
 }
 
 async function elevenStreamUlaw(text, onAudioChunk) {
-  // Stream endpoint returns audio bytes (format defined by output_format)
   const voiceId = ENV.ELEVEN_VOICE_ID;
   const outputFormat = ENV.ELEVEN_OUTPUT_FORMAT || "ulaw_8000";
   const modelId = ENV.ELEVEN_TTS_MODEL || "eleven_v3";
@@ -458,9 +456,8 @@ async function elevenStreamUlaw(text, onAudioChunk) {
   }
 }
 
-// -------------------- OpenAI fallback (text-only, short, returns to flow) --------------------
+// -------------------- OpenAI fallback --------------------
 async function openaiFallbackReply({ userText, state, question }) {
-  // If no key, just return a deterministic nudge.
   if (!ENV.OPENAI_API_KEY) {
     return question || "אפשר לחזור רגע—מה השם המלא שלכם?";
   }
@@ -498,11 +495,9 @@ async function openaiFallbackReply({ userText, state, question }) {
     const json = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(json?.error?.message || "fallback_http_error");
 
-    // Extract text safely
     const out = (json.output_text || "").toString().trim();
     if (out) return out.slice(0, 240);
 
-    // Older shapes: scan output
     const alt = JSON.stringify(json);
     return alt ? question : question;
   } catch (e) {
@@ -525,9 +520,8 @@ wss.on("connection", (twilioWs) => {
   let caller = "";
   let called = "";
   let callerPhoneLocal = "";
-  let openingPlayedByTwilio = false; // ignored for flow; kept for compatibility
+  let openingPlayedByTwilio = false;
 
-  // States
   const STATES = {
     OPENING: "OPENING",
     ASK_NAME: "ASK_NAME",
@@ -543,7 +537,6 @@ wss.on("connection", (twilioWs) => {
   let pendingName = { first: "", last: "" };
   let pendingPhone = "";
 
-  // Timers
   let idleWarnTimer = null;
   let idleHangTimer = null;
   let maxCallTimer = null;
@@ -590,11 +583,10 @@ wss.on("connection", (twilioWs) => {
     }
   }
 
-  // -------------------- BOT Speech Queue (ElevenLabs) --------------------
+  // -------------------- BOT Speech Queue --------------------
   let ttsActive = false;
   const speechQueue = [];
 
-  // Call end scheduling
   let endRequested = false;
   let endReason = "";
   let endAfterMs = 0;
@@ -609,9 +601,8 @@ wss.on("connection", (twilioWs) => {
     twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
   }
 
-  // Twilio Media Streams expects ~20ms frames at 8kHz for g711_ulaw: 160 bytes each.
   const ULaw_FRAME_BYTES = 160;
-  let ulawOutQueue = [];          // Array<Uint8Array>
+  let ulawOutQueue = [];
   let ulawOutBuffer = Buffer.alloc(0);
   let ulawOutTimer = null;
 
@@ -628,14 +619,12 @@ wss.on("connection", (twilioWs) => {
         const frame = ulawOutQueue.shift();
         sendTwilioUlawFrame(frame);
       } catch (e) {
-        // don't crash on pump errors
         logError("uLaw pump error", String(e?.message || e));
       }
     }, 20);
   }
 
   function enqueueUlawBytes(chunkBytes) {
-    // chunkBytes: Uint8Array
     ulawOutBuffer = Buffer.concat([ulawOutBuffer, Buffer.from(chunkBytes)]);
     while (ulawOutBuffer.length >= ULaw_FRAME_BYTES) {
       const frame = ulawOutBuffer.subarray(0, ULaw_FRAME_BYTES);
@@ -647,12 +636,10 @@ wss.on("connection", (twilioWs) => {
 
   async function speakWithEleven(text) {
     if (!assertElevenConfigured()) {
-      // Fail-safe: do nothing, but log
       logError("Eleven not configured (missing ELEVEN_API_KEY/ELEVEN_VOICE_ID)");
       return;
     }
     await elevenStreamUlaw(text, async (chunk) => {
-      // chunk is Uint8Array
       enqueueUlawBytes(chunk);
     });
   }
@@ -662,7 +649,6 @@ wss.on("connection", (twilioWs) => {
 
     if (speechQueue.length === 0) {
       if (endRequested) {
-        // schedule final+hangup after grace
         finalizeAndHangup(endReason).catch(() => {});
       }
       return;
@@ -677,7 +663,6 @@ wss.on("connection", (twilioWs) => {
       logError("Eleven speak error", String(e?.message || e));
     } finally {
       ttsActive = false;
-      // small tail to avoid barge-in clipping
       setTimeout(() => {
         tryDequeueSpeech().catch(() => {});
       }, Math.max(0, ENV.MB_NO_BARGE_TAIL_MS || 0));
@@ -693,16 +678,16 @@ wss.on("connection", (twilioWs) => {
     tryDequeueSpeech().catch(() => {});
   }
 
-  // -------------------- FLOW Questions (short and strict) --------------------
+  // -------------------- FLOW Questions --------------------
   function askCurrentQuestionQueued() {
     if (callClosed) return;
     if (state === STATES.ASK_NAME) {
-      // שינוי לפי בקשת המשתמש: שם מלא (בלי "פרטי ומשפחה")
       sayQueue("מה השם המלא שלכם?");
       return;
     }
     if (state === STATES.ASK_PHONE) {
-      sayQueue("מה מספר הטלפון לחזרה? ספרה-ספרה.");
+      // ✅ שינוי יחיד כאן: בלי "ספרה-ספרה"
+      sayQueue("מה מספר הטלפון לחזרה?");
       return;
     }
     if (state === STATES.CONFIRM_PHONE) {
@@ -742,12 +727,10 @@ wss.on("connection", (twilioWs) => {
     if (parts.length === 0) return null;
     if (parts.length > 6) return null;
 
-    // שינוי לפי בקשת המשתמש: אם שם אחד -> FIRSTNAME בלבד, אם יותר -> FIRSTNAME + LASTNAME (כל השאר)
     if (parts.length === 1) return { first: parts[0], last: "" };
     return { first: parts[0], last: parts.slice(1).join(" ") };
   }
 
-  // Hebrew number-words -> digits
   const HEB_DIGIT_WORDS = new Map([
     ["אפס","0"],["0","0"],
     ["אחד","1"],["אחת","1"],["1","1"],
@@ -775,7 +758,7 @@ wss.on("connection", (twilioWs) => {
     return "";
   }
 
-  // -------------------- Caller type logic (per user request) --------------------
+  // -------------------- Caller type logic --------------------
   function isMobileCallerE164(e164) {
     const s = safeStr(e164);
     return s.startsWith("+9725");
@@ -796,7 +779,6 @@ wss.on("connection", (twilioWs) => {
   function looksOffScript(userText) {
     const t = normalizeText(userText);
     if (!t) return false;
-    // Typical off-script phrases that caused "drift"
     return (
       t.includes("מסלולי") ||
       t.includes("לימוד") ||
@@ -806,7 +788,7 @@ wss.on("connection", (twilioWs) => {
       t.includes("תסביר") ||
       t.includes("מי אתם") ||
       t.includes("מה אתם") ||
-      t.length > 22 // long rambles likely not answer
+      t.length > 22
     );
   }
 
@@ -814,14 +796,13 @@ wss.on("connection", (twilioWs) => {
     retries.offscript += 1;
     const questionTextForState = (() => {
       if (state === STATES.ASK_NAME) return "מה השם המלא שלכם?";
-      if (state === STATES.ASK_PHONE) return "מה מספר הטלפון לחזרה? ספרה-ספרה.";
+      if (state === STATES.ASK_PHONE) return "מה מספר הטלפון לחזרה?";
       if (state === STATES.CONFIRM_PHONE) return `המספר הוא ${digitsSpaced(pendingPhone)}. נכון?`;
       return "אפשר לענות רגע?";
     })();
 
     const fb = await openaiFallbackReply({ userText, state, question: questionTextForState });
     sayQueue(fb);
-    // Then ask the actual question again (strict)
     setTimeout(() => askCurrentQuestionQueued(), 250);
   }
 
@@ -832,16 +813,11 @@ wss.on("connection", (twilioWs) => {
     clearTimers();
     const skipClosing = !!opts.skipClosing;
 
-    // ✅ If we want a clean, instant, non-cutoff closing:
-    // Redirect Twilio call to play the recorded closing MP3, then hang up.
-    // We keep CRM/webhook logic unchanged and still send FINAL from here.
     if (!skipClosing) {
-      // Mark DONE so we don't continue flow
       state = STATES.DONE;
 
       const r = await playTwilioAsset(callSid, TWILIO_CLOSING_MP3_URL);
       if (!r.ok) {
-        // Fallback: if redirect fails, use existing TTS closing text
         const closing =
           ENV.MB_CLOSING_TEXT ||
           "תודה רבה, הפרטים נרשמו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
@@ -855,8 +831,6 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // Send FINAL after the closing audio should have finished, then close the WS.
-      // (Twilio will hang up via the redirected TwiML.)
       setTimeout(async () => {
         try {
           await sendFinal(callSid, reason || "completed_flow");
@@ -867,7 +841,6 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // Skip closing path (refusal/timeouts): do a short deterministic close
     if (state !== STATES.DONE) state = STATES.DONE;
 
     endRequested = true;
@@ -922,12 +895,11 @@ wss.on("connection", (twilioWs) => {
 
     const systemPrompt = getSystemPromptFromMBConversationPrompt();
 
-    // STT-only session: we do NOT request model-generated responses.
     sendOpenAI({
       type: "session.update",
       session: {
         instructions: systemPrompt || "",
-        modalities: ["text"], // we don't need audio output from OpenAI
+        modalities: ["text"],
         input_audio_format: "g711_ulaw",
         turn_detection: {
           type: "server_vad",
@@ -953,7 +925,6 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // STT completed event
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const transcript = (msg.transcript || "").trim();
       if (!transcript) return;
@@ -969,21 +940,16 @@ wss.on("connection", (twilioWs) => {
         return;
       }
 
-      // If caller starts talking during opening, we ignore their words and proceed.
       if (state === STATES.OPENING) {
-        // Do nothing; we will move to ASK_NAME after opening speech completes.
         return;
       }
 
-      // Off-script fallback (rare)
       if (looksOffScript(transcript)) {
         await handleOffScript(transcript);
         return;
       }
 
-      // Strict flow
       if (state === STATES.ASK_NAME) {
-        // If they say "כן/אוקיי" etc, just repeat question
         const yn = detectYesNo(transcript);
         if (yn === "yes") {
           askCurrentQuestionQueued();
@@ -998,18 +964,15 @@ wss.on("connection", (twilioWs) => {
             await finishCall("name_missing", { skipClosing: true });
             return;
           }
-          // שינוי תסריט: בקשה חוזרת לשם מלא (בלי אימות)
           sayQueue("לא שמעתי טוב. מה השם המלא שלכם?");
           return;
         }
 
-        // שינוי לפי בקשת המשתמש: אין אימות שם — שומרים מיד
         pendingName = nameObj;
         const c = getCall(callSid);
         c.lead.first_name = pendingName.first || "";
         c.lead.last_name = pendingName.last || "";
 
-        // שינוי לפי בקשת המשתמש: לוגיקת טלפון לפי קידומת Caller ID
         if (caller && isMobileCallerE164(caller) && callerPhoneLocal) {
           c.lead.phone_number = callerPhoneLocal;
           logInfo("[STATE] ASK_NAME -> DONE (mobile caller, use caller)", { phone_number: callerPhoneLocal, name: pendingName });
@@ -1017,17 +980,8 @@ wss.on("connection", (twilioWs) => {
           return;
         }
 
-        if (caller && isLandlineCallerE164(caller)) {
-          // נייח: מבקשים טלפון לחזרה
-          state = STATES.ASK_PHONE;
-          logInfo("[STATE] ASK_NAME -> ASK_PHONE (landline caller)", { caller });
-          askCurrentQuestionQueued();
-          return;
-        }
-
-        // ברירת מחדל (ללא שינוי דרמטי מעבר לבקשה): אם אין/לא ברור Caller — מבקשים טלפון לחזרה
         state = STATES.ASK_PHONE;
-        logInfo("[STATE] ASK_NAME -> ASK_PHONE (default)", { caller });
+        logInfo("[STATE] ASK_NAME -> ASK_PHONE", { caller });
         askCurrentQuestionQueued();
         return;
       }
@@ -1041,7 +995,8 @@ wss.on("connection", (twilioWs) => {
             await finishCall("invalid_phone", { skipClosing: true });
             return;
           }
-          sayQueue("ספרה-ספרה. 9–10 ספרות.");
+          // ✅ שינוי יחיד כאן: בלי הסברים (ספרה-ספרה / 9–10 ספרות)
+          sayQueue("לא קלטתי. אפשר לחזור על מספר הטלפון לחזרה?");
           return;
         }
 
@@ -1062,14 +1017,12 @@ wss.on("connection", (twilioWs) => {
           return;
         }
         if (yn === "no") {
-          retries.confirmPhone += 1;
           state = STATES.ASK_PHONE;
           logInfo("[STATE] CONFIRM_PHONE -> ASK_PHONE (retry)");
           sayQueue("אוקיי. תגידו שוב את המספר.");
           return;
         }
 
-        // If they say a number instead of yes/no
         const p = extractPhoneFromTranscript(transcript);
         if (p && isValidILPhoneDigits(p)) {
           pendingPhone = p;
@@ -1080,8 +1033,6 @@ wss.on("connection", (twilioWs) => {
         sayQueue("כן או לא?");
         return;
       }
-
-      return;
     }
 
     if (msg.type === "error") {
@@ -1126,23 +1077,18 @@ wss.on("connection", (twilioWs) => {
       logInfo("RECORDING>", rec);
       if (rec.ok) c.recordingSid = rec.sid || "";
 
-      // OPENING:
-      // If Twilio already played opening.mp3 (opening_played=1), do NOT speak MB_OPENING_TEXT again.
       if (openingPlayedByTwilio) {
         state = STATES.ASK_NAME;
         callClosed = false;
         logInfo("[FLOW] start -> ASK_NAME (opening already played by Twilio)");
-        // Start immediately (stream starts only after Twilio <Play> finished)
         setTimeout(() => startFlowProactively(), 0);
       } else {
         state = STATES.OPENING;
         if (ENV.MB_OPENING_TEXT) {
           sayQueue(ENV.MB_OPENING_TEXT);
         } else {
-          // Minimal opening if ENV missing
           sayQueue("שלום. אני נטע ממערכת הרישום של מרכז מל\"מ.");
         }
-        // Give the opening a moment to start; the Half-Duplex speech queue will prevent barge-in.
         setTimeout(() => startFlowProactively(), 0);
       }
 
@@ -1154,7 +1100,6 @@ wss.on("connection", (twilioWs) => {
     if (data.event === "media") {
       const payload = data.media?.payload;
       if (!payload) return;
-      // Forward audio to OpenAI STT
       sendOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
