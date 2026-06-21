@@ -45,7 +45,7 @@ const ENV = {
 
   OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
   OPENAI_VOICE: process.env.OPENAI_VOICE || "cedar",
-  OPENAI_REALTIME_MODEL: process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview",
+  PENAI_REALTIME_MODEL: process.env.PENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28",
 
   PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || "",
 
@@ -90,7 +90,7 @@ function normalizeText(s) {
     .toLowerCase();
 }
 
-// â IL validation
+// ✅ IL validation
 function isValidILPhoneDigits(d) {
   const x = digitsOnly(d);
   if (x.length === 10 && x.startsWith("05")) return true; // mobile
@@ -98,7 +98,7 @@ function isValidILPhoneDigits(d) {
   return false;
 }
 
-// â speak phone
+// ✅ speak phone
 function phoneForSpeech(d) {
   // ONLY CHANGE: digit-by-digit to avoid missing digits in TTS
   const x = digitsOnly(d);
@@ -112,17 +112,17 @@ function detectYesNo(s) {
   if (!t) return null;
   const tokens = t.split(" ").filter(Boolean);
 
-  const YES_SET = new Set(["××", "×××", "××¡××¨", "×××§××", "×××§×", "ok", "okay", "yes", "× ×××", "×××©×¨", "×××©×¨×ª", "×¡×××", "×××××"]);
+  const YES_SET = new Set(["כן", "בטח", "בסדר", "אוקיי", "אוקי", "ok", "okay", "yes", "נכון", "מאשר", "מאשרת", "סבבה", "יאללה"]);
   const hasYes = tokens.some((w) => YES_SET.has(w));
-  const hasNo = tokens.some((w) => w === "××" || w === "no");
+  const hasNo = tokens.some((w) => w === "לא" || w === "no");
 
   const hasStrongNo =
-    t.includes("×× ×¨××¦×") ||
-    t.includes("×× ××¢×× ×××") ||
-    t.includes("×× ××¢×× ××× ×ª") ||
-    t.includes("×××© ××") ||
-    t === "×¢×××" ||
-    t === "×¢×××";
+    t.includes("לא רוצה") ||
+    t.includes("לא מעוניין") ||
+    t.includes("לא מעוניינת") ||
+    t.includes("ממש לא") ||
+    t === "עזוב" ||
+    t === "עזבי";
 
   const short = tokens.length <= 6;
 
@@ -135,13 +135,13 @@ function detectYesNo(s) {
 function isRefusal(text) {
   const t = normalizeText(text);
   return (
-    t.includes("×× ×¨××¦×") ||
-    t.includes("×× ××¢×× ×××") ||
-    t.includes("×× ××¢×× ××× ×ª") ||
-    t === "×××" ||
-    t === "×××ª×¨×××ª" ||
-    t === "×¢×××" ||
-    t === "×¢×××"
+    t.includes("לא רוצה") ||
+    t.includes("לא מעוניין") ||
+    t.includes("לא מעוניינת") ||
+    t === "ביי" ||
+    t === "להתראות" ||
+    t === "עזוב" ||
+    t === "עזבי"
   );
 }
 
@@ -156,7 +156,7 @@ function getSystemPromptFromMBConversationPrompt() {
 }
 
 function openaiWsUrl() {
-  const model = ENV.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
+  const model = ENV.PENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28";
   return `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
 }
 
@@ -322,7 +322,7 @@ function addTranscriptMemory(callSid, text) {
 
 function computeStatus(lead) {
   const ok = !!safeStr(lead.first_name) && !!safeStr(lead.phone_number) && isValidILPhoneDigits(lead.phone_number);
-  return ok ? { code: "completed", label: "×©××× ××××" } : { code: "partial", label: "×©××× ×××§××ª" };
+  return ok ? { code: "completed", label: "שיחה מלאה" } : { code: "partial", label: "שיחה חלקית" };
 }
 
 function getPublicOrigin() {
@@ -380,7 +380,7 @@ async function sendFinal(callSid, reason) {
     source: "Voice AI - Nice Line",
     timestamp: nowIso(),
     reason: reason || "call_end",
-    remarks: `×¡××××¡: ${status.label} | consent: ${c.meta.consent || "skipped"} | name: ${c.lead.first_name || ""} ${c.lead.last_name || ""}`.trim(),
+    remarks: `סטטוס: ${status.label} | consent: ${c.meta.consent || "skipped"} | name: ${c.lead.first_name || ""} ${c.lead.last_name || ""}`.trim(),
   };
 
   if (ENV.MB_LOG_CRM) logInfo("CRM> sending FINAL", payload);
@@ -448,19 +448,19 @@ async function elevenStreamUlaw(text, onAudioChunk) {
 
 // -------------------- OpenAI fallback --------------------
 async function openaiFallbackReply({ userText, state, question }) {
-  if (!ENV.OPENAI_API_KEY) return question || "××¤×©×¨ ××¢× ××ª ×¨××¢ ×¢× ××©×××?";
+  if (!ENV.OPENAI_API_KEY) return question || "אפשר לענות רגע על השאלה?";
 
   const sys =
-    "××ª× ×¢×××¨×× ×××¤×× ××× ×§×¦×¨×× ××¢××¨××ª. " +
-    "×××ª×¨ ××× ××××× ××©×¤× ××× ××××. " +
-    "××¡××¨ ××©××× ×©××××ª ×××©××ª. " +
-    "××××¨× ××××××: ××××××¨ ××ª ×××©×ª××© ××©××× ×× ×××××ª.";
+    "אתם עוזרים טלפוניים קצרים בעברית. " +
+    "מותר לכם להגיד משפט אחד בלבד. " +
+    "אסור לשאול שאלות חדשות. " +
+    "המטרה היחידה: להחזיר את המשתמש לשאלה הנוכחית.";
 
   const user =
-    `×××©×ª××© ×××¨: "${safeStr(userText)}"\n` +
-    `××¡×××× ×× ××××: ${state}\n` +
-    `××©××× ×× ×××××ª: "${question}"\n` +
-    "×ª× × ××©×¤× ××× ××××.";
+    `המשתמש אמר: "${safeStr(userText)}"\n` +
+    `הסטייט הנוכחי: ${state}\n` +
+    `השאלה הנוכחית: "${question}"\n` +
+    "תנו משפט אחד בלבד.";
 
   try {
     const res = await fetch("https://api.openai.com/v1/responses", {
@@ -477,15 +477,15 @@ async function openaiFallbackReply({ userText, state, question }) {
     if (!res.ok) throw new Error(json?.error?.message || "fallback_http_error");
 
     const out = (json.output_text || "").toString().trim();
-    return out ? out.slice(0, 240) : (question || "××¤×©×¨ ××¢× ××ª ×¨××¢ ×¢× ××©×××?");
+    return out ? out.slice(0, 240) : (question || "אפשר לענות רגע על השאלה?");
   } catch {
-    return question || "××¤×©×¨ ××¢× ××ª ×¨××¢ ×¢× ××©×××?";
+    return question || "אפשר לענות רגע על השאלה?";
   }
 }
 
 // -------------------- Server + WS --------------------
 const server = app.listen(PORT, () => {
-  logInfo(`â Service running on port ${PORT}`);
+  logInfo(`✅ Service running on port ${PORT}`);
 });
 
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
@@ -543,7 +543,7 @@ wss.on("connection", (twilioWs) => {
     if (ENV.MB_IDLE_WARNING_MS > 0) {
       if (idleWarnTimer) clearTimeout(idleWarnTimer);
       idleWarnTimer = setTimeout(() => {
-        sayQueue("××¤×©×¨ ××¢× ××ª ×¨××¢?");
+        sayQueue("אפשר לענות רגע?");
         askCurrentQuestionQueued();
       }, ENV.MB_IDLE_WARNING_MS);
     }
@@ -560,7 +560,7 @@ wss.on("connection", (twilioWs) => {
       const warnAt = Math.max(0, ENV.MB_MAX_CALL_MS - ENV.MB_MAX_WARN_BEFORE_MS);
       maxCallWarnTimer = setTimeout(() => {
         if (callClosed) return;
-        sayQueue("×¢×× ×¨××¢ ××¡×××××.");
+        sayQueue("עוד רגע מסיימים.");
         askCurrentQuestionQueued();
       }, warnAt);
     }
@@ -623,7 +623,7 @@ wss.on("connection", (twilioWs) => {
   }
 
   const openaiWs = new WebSocket(openaiWsUrl(), {
-    headers: { Authorization: `Bearer ${ENV.OPENAI_API_KEY}` },
+    headers: { Authorization: `Bearer ${ENV.OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" },
   });
 
   let openaiReady = false;
@@ -711,10 +711,10 @@ wss.on("connection", (twilioWs) => {
 
   function askCurrentQuestionQueued() {
     if (callClosed) return;
-    if (state === STATES.ASK_NAME) return sayQueue("×× ××©× ×××× ×©×××?");
-    if (state === STATES.ASK_PHONE) return sayQueue("×× ××¡×¤×¨ ××××¤×× ××××¨×?");
+    if (state === STATES.ASK_NAME) return sayQueue("מה השם המלא שלכם?");
+    if (state === STATES.ASK_PHONE) return sayQueue("מה מספר הטלפון לחזרה?");
     if (state === STATES.CONFIRM_PHONE) {
-      sayQueue(`×××¡×¤×¨ ××× ${phoneForSpeech(pendingPhone)}. × ×××?`);
+      sayQueue(`המספר הוא ${phoneForSpeech(pendingPhone)}. נכון?`);
       return;
     }
   }
@@ -739,7 +739,7 @@ wss.on("connection", (twilioWs) => {
       .trim();
   }
 
-  const NAME_TRASH = new Set(["×××","×©×××","×××","××","××","×××§××","×××§×","××¡××¨","× ×","×××¨","×ª××©××","×§××××","×××××"]);
+  const NAME_TRASH = new Set(["הלו","שלום","היי","כן","לא","אוקיי","אוקי","בסדר","נו","דבר","תמשיך","קדימה","יאללה"]);
 
   function parseName(text) {
     const raw = cleanHebrewName(text);
@@ -757,16 +757,16 @@ wss.on("connection", (twilioWs) => {
   }
 
   const HEB_DIGIT_WORDS = new Map([
-    ["××¤×¡","0"],["0","0"],
-    ["×××","1"],["×××ª","1"],["1","1"],
-    ["×©×ª×××","2"],["×©× ×××","2"],["×©×ª××","2"],["2","2"],
-    ["×©×××©","3"],["×©×××©×","3"],["3","3"],
-    ["××¨××¢","4"],["××¨××¢×","4"],["4","4"],
-    ["×××©","5"],["××××©×","5"],["5","5"],
-    ["×©×©","6"],["×©××©×","6"],["6","6"],
-    ["×©××¢","7"],["×©××¢×","7"],["7","7"],
-    ["×©××× ×","8"],["8","8"],
-    ["×ª×©×¢","9"],["×ª×©×¢×","9"],["9","9"],
+    ["אפס","0"],["0","0"],
+    ["אחד","1"],["אחת","1"],["1","1"],
+    ["שתיים","2"],["שניים","2"],["שתים","2"],["2","2"],
+    ["שלוש","3"],["שלושה","3"],["3","3"],
+    ["ארבע","4"],["ארבעה","4"],["4","4"],
+    ["חמש","5"],["חמישה","5"],["5","5"],
+    ["שש","6"],["שישה","6"],["6","6"],
+    ["שבע","7"],["שבעה","7"],["7","7"],
+    ["שמונה","8"],["8","8"],
+    ["תשע","9"],["תשעה","9"],["9","9"],
   ]);
 
   function extractPhoneFromTranscript(text) {
@@ -801,7 +801,7 @@ wss.on("connection", (twilioWs) => {
 
       const r = await playTwilioAsset(callSid, TWILIO_CLOSING_MP3_URL);
       if (!r.ok) {
-        const closing = ENV.MB_CLOSING_TEXT || "×ª××× ×¨××, ××¤×¨××× × ×¨×©××. × ×¦×× ×××¨×× ×××××¨ ××××× ×××§××. ××× ×××.";
+        const closing = ENV.MB_CLOSING_TEXT || "תודה רבה, הפרטים נרשמו. נציג המרכז יחזור אליכם בהקדם. יום טוב.";
         sayQueue(closing);
 
         endRequested = true;
@@ -863,7 +863,7 @@ wss.on("connection", (twilioWs) => {
         input_audio_transcription: {
           model: "gpt-4o-mini-transcribe",
           language: ENV.MB_STT_LANGUAGE,
-          prompt: "×ª×××× ××¢××¨××ª ×ª×§×× ×. ×©×××ª ××¢××¨××ª. ××¡×¤×¨× ×××¤×× ×××©×¨×× ××ª××××× ×-0.",
+          prompt: "תמללו בעברית תקינה. שמות בעברית. מספרי טלפון בישראל מתחילים ב-0.",
         },
       },
     });
@@ -879,7 +879,7 @@ wss.on("connection", (twilioWs) => {
 
       if (!listenEnabled || Date.now() < listenResumeAt) return;
 
-      if (transcript.includes("×ª×××× ××¢××¨××ª ×ª×§×× ×") || transcript.includes("×©×××ª ××¢××¨××ª")) {
+      if (transcript.includes("תמללו בעברית תקינה") || transcript.includes("שמות בעברית")) {
         askCurrentQuestionQueued();
         return;
       }
@@ -890,7 +890,7 @@ wss.on("connection", (twilioWs) => {
       armIdleTimers();
 
       if (isRefusal(transcript)) {
-        sayQueue("××¡××¨. ×ª××× ×××× × ×¢××.");
+        sayQueue("בסדר. תודה ויום נעים.");
         await finishCall("user_refused", { skipClosing: true });
         return;
       }
@@ -900,11 +900,11 @@ wss.on("connection", (twilioWs) => {
         if (!nameObj) {
           retries.name += 1;
           if (retries.name >= 3) {
-            sayQueue("×× ××¦×××ª× ××§××× ×©×. ×ª××× ×××× × ×¢××.");
+            sayQueue("לא הצלחתי לקלוט שם. תודה ויום נעים.");
             await finishCall("name_missing", { skipClosing: true });
             return;
           }
-          sayQueue("×× ×©××¢×ª× ×××. ×× ××©× ×××× ×©×××?");
+          sayQueue("לא שמעתי טוב. מה השם המלא שלכם?");
           return;
         }
 
@@ -932,11 +932,11 @@ wss.on("connection", (twilioWs) => {
         if (!p || !isValidILPhoneDigits(p)) {
           retries.phone += 1;
           if (retries.phone >= 3) {
-            sayQueue("×× ××¦×××ª× ××§××× ××¡×¤×¨ ×ª×§××. ×ª××× ×××× × ×¢××.");
+            sayQueue("לא הצלחתי לקלוט מספר תקין. תודה ויום נעים.");
             await finishCall("invalid_phone", { skipClosing: true });
             return;
           }
-          sayQueue("×× ×§×××ª×. ××¤×©×¨ ×××××¨ ×¢× ××¡×¤×¨ ××××¤×× ××××¨×?");
+          sayQueue("לא קלטתי. אפשר לחזור על מספר הטלפון לחזרה?");
           return;
         }
 
@@ -961,7 +961,7 @@ wss.on("connection", (twilioWs) => {
         if (yn === "no") {
           state = STATES.ASK_PHONE;
           logInfo("[STATE] CONFIRM_PHONE -> ASK_PHONE (retry)");
-          sayQueue("×××§××. ×ª×××× ×©×× ××ª ×××¡×¤×¨.");
+          sayQueue("אוקיי. תגידו שוב את המספר.");
           return;
         }
 
@@ -972,7 +972,7 @@ wss.on("connection", (twilioWs) => {
           return;
         }
 
-        sayQueue("×× ×× ××?");
+        sayQueue("כן או לא?");
         return;
       }
     }
@@ -1038,7 +1038,7 @@ wss.on("connection", (twilioWs) => {
       callClosed = true;
       logInfo("Twilio stop", { streamSid, callSid });
 
-      // preserve pendingPhone if call ends before "××"
+      // preserve pendingPhone if call ends before "כן"
       try {
         const c = getCall(callSid);
         if (!c.lead.phone_number && pendingPhone && isValidILPhoneDigits(pendingPhone)) {
