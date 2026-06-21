@@ -45,7 +45,7 @@ const ENV = {
 
   OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
   OPENAI_VOICE: process.env.OPENAI_VOICE || "cedar",
-  PENAI_REALTIME_MODEL: process.env.PENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28",
+  OPENAI_REALTIME_MODEL: process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28",
 
   PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || "",
 
@@ -156,7 +156,7 @@ function getSystemPromptFromMBConversationPrompt() {
 }
 
 function openaiWsUrl() {
-  const model = ENV.PENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28";
+  const model = ENV.OPENAI_REALTIME_MODEL || "gpt-realtime-2025-08-28";
   return `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
 }
 
@@ -623,7 +623,7 @@ wss.on("connection", (twilioWs) => {
   }
 
   const openaiWs = new WebSocket(openaiWsUrl(), {
-    headers: { Authorization: `Bearer ${ENV.OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" },
+    headers: { Authorization: `Bearer ${ENV.OPENAI_API_KEY}` },
   });
 
   let openaiReady = false;
